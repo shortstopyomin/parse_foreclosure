@@ -153,6 +153,11 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
     for (line in lines) {
         val trimmed = line.trim()
 
+        // 跨頁標記「(續上頁)」防護：忽略跨頁頁頭，不終止表格狀態
+        if (trimmed.contains("續上頁") || trimmed.contains("續頁")) {
+            continue
+        }
+
         // 遇見獨立的「土 地 坐 落」或「土地坐落」表格標題
         if (trimmed.contains("土地坐落") || (trimmed.contains("土") && trimmed.contains("地") && trimmed.contains("坐"))) {
             isInsideLandTable = true
@@ -206,39 +211,47 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
     val lines = attachmentText.lines()
 
     var isInsideBuildingTable = false
-    val bldgRowRegex = Regex("""^(?:(?<itemNo>\d+)\s+)?(?<bldgNo>\d{3,5})\s+(?<baseLoc>[\u4e00-\u9fa50-9]+.*)?$""")
+    // 正則匹配建號行：項次(選填) + 建號數字(2-5位) + 後續基地坐落門牌
+    val bldgRowRegex = Regex("""^(?:(?<itemNo>\d+)\s+)?(?<bldgNo>\d{2,5})\s+(?<rest>.*)$""")
 
     for (line in lines) {
         val trimmed = line.trim()
+
+        // 跨頁標記「(續上頁)」防護：忽略跨頁頁頭，不終止表格狀態
+        if (trimmed.contains("續上頁") || trimmed.contains("續頁")) {
+            continue
+        }
 
         if (trimmed.contains("建號") || trimmed.contains("建 號") || trimmed.contains("建物面積") || trimmed.contains("建物門牌")) {
             isInsideBuildingTable = true
         }
 
-        if (isInsideBuildingTable && (trimmed.contains("使用情形") || trimmed.contains("點交情形") || trimmed.contains("備註"))) {
+        // 遇到拍賣點交或使用情形說明，結束建物表格
+        if (isInsideBuildingTable && (trimmed.contains("使用情形") || trimmed.contains("點交情形") || trimmed.contains("點交否"))) {
             isInsideBuildingTable = false
         }
 
         if (isInsideBuildingTable) {
-            // 過濾小數點面積 (如 22.44)、分之、金額元、陽台、合計等非建號干擾列
-            if (trimmed.contains(".") || trimmed.contains("分之") || trimmed.contains("元") || 
-                trimmed.contains("陽台") || trimmed.contains("合計") || trimmed.contains("雨遮") || trimmed.contains("備考")) {
+            // 排除表格欄位標頭列與頁碼標籤列
+            if (trimmed.contains("編號") || trimmed.contains("門牌") || trimmed.contains("備考") || 
+                trimmed.contains("公尺") || trimmed.contains("權利範圍") || trimmed.contains("第") && trimmed.contains("頁")) {
                 continue
             }
 
             val match = bldgRowRegex.find(trimmed)
             if (match != null) {
                 val bldgNo = match.safeGroupValue("bldgNo")
-                val baseLoc = match.safeGroupValue("baseLoc")
+                val rest = match.safeGroupValue("rest")
 
-                if (bldgNo.isNotBlank() && bldgNo.length in 3..5 && 
+                // 排除執字案號與無效數字
+                if (bldgNo.isNotBlank() && bldgNo.length in 2..5 && 
                     !bldgNo.startsWith("114") && !bldgNo.startsWith("115") && 
                     bldgNo != "122947" && bldgNo != "131969" && bldgNo != "133508" && bldgNo != "90563") {
                     
                     val item = BuildingInfo(
                         id = (results.size + 1).toString(),
                         buildingNumber = bldgNo,
-                        baseLocation = baseLoc
+                        baseLocation = rest
                     )
                     if (results.none { it.buildingNumber == item.buildingNumber }) {
                         results.add(item)
