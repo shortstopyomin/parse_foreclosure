@@ -12,6 +12,7 @@ data class LandLocation(
     val section: String,
     val subSection: String,
     val landNumber: String,
+    val rightScope: String = "",
     val buildingNumbers: MutableList<String> = mutableListOf()
 )
 
@@ -19,7 +20,8 @@ data class LandLocation(
 data class BuildingInfo(
     val id: String,
     val buildingNumber: String,
-    val baseLocation: String
+    val baseLocation: String,
+    val rightScope: String = ""
 )
 
 fun main(args: Array<String>) {
@@ -29,6 +31,7 @@ fun main(args: Array<String>) {
 
     println("==================================================")
     println("     法院拍賣公告 - 多檔案批次土地與建號解析器     ")
+    println("  Court Auction Announcement - Land & Building Parser  ")
     println("==================================================")
 
     val pdfFiles = if (args.isNotEmpty()) {
@@ -39,15 +42,15 @@ fun main(args: Array<String>) {
     }
 
     if (pdfFiles.isEmpty()) {
-        println("⚠️ 提示：未找到任何 PDF 檔案。請將拍賣公告 PDF 檔放入 D:/projects/land_number_parse/ 目錄中。")
+        println("⚠️ 提示 (Notice)：未找到任何 PDF 檔案 (No PDF files found)。請將拍賣公告 PDF 檔放入 D:/projects/land_number_parse/ 目錄中。")
         return
     }
 
-    println("共找到 ${pdfFiles.size} 個 PDF 檔案，開始進行批次解析...\n")
+    println("共找到 ${pdfFiles.size} 個 PDF 檔案 (Found ${pdfFiles.size} PDF files)，開始進行批次解析...\n")
 
     for ((fileIndex, pdfFile) in pdfFiles.withIndex()) {
         println("==================================================")
-        println("📄 檔案 [${fileIndex + 1}/${pdfFiles.size}]：${pdfFile.name}")
+        println("📄 檔案 File [${fileIndex + 1}/${pdfFiles.size}]：${pdfFile.name}")
         println("==================================================")
 
         try {
@@ -72,51 +75,54 @@ fun main(args: Array<String>) {
                     }
                 }
 
-                // 印出土地標的解析結果
+                // 印出土地標的雙語解析結果
                 if (landResults.isEmpty()) {
-                    println("ℹ️ 【提示】本案無拍賣土地標的（附表中無「土地坐落」表格，僅法拍建物）。地號：(無)")
+                    println("ℹ️ 【提示 Notice】本案無拍賣土地標的（僅法拍建物）。")
+                    println("   No land target in this auction (Building only). 地號 Land Number: (無 None)")
                 } else {
-                    println("🎯 「土地標的附表」小段與地號解析結果 (共 ${landResults.size} 筆土地標的)：")
+                    println("🎯 「土地標的附表」解析結果 Land Target Table Results (共 ${landResults.size} 筆土地標的)：")
                     println("--------------------------------------------------")
                     for ((index, item) in landResults.withIndex()) {
-                        println("【土地標的 ${index + 1}】")
-                        if (item.county.isNotBlank()) println("  📍 縣市:     " + item.county)
-                        if (item.district.isNotBlank()) println("  📍 鄉鎮市區: " + item.district)
-                        println("  📍 段別:     " + item.section)
-                        println("  🔹 小段:     " + (if (item.subSection.isBlank()) "(無小段 / 空白)" else item.subSection))
-                        println("  📌 地號:     " + item.landNumber + " 地號")
+                        println("【土地標的 Land Target ${index + 1}】")
+                        if (item.county.isNotBlank()) println("  📍 縣市 City/County:            " + item.county)
+                        if (item.district.isNotBlank()) println("  📍 鄉鎮市區 District:           " + item.district)
+                        println("  📍 段別 Section:                " + item.section)
+                        println("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
+                        println("  📌 地號 Land Number:            " + item.landNumber + " 地號 (Land No. " + item.landNumber + ")")
+                        if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
                         
                         val bldgText = if (item.buildingNumbers.isNotEmpty()) {
-                            item.buildingNumbers.joinToString(", ") { it + " 建號" }
+                            item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
                         } else {
-                            "(無對應建號)"
+                            "(無對應建號 No Corresponding Building Number)"
                         }
-                        println("  🏢 對應建號: " + bldgText)
+                        println("  🏢 對應建號 Building Number:   " + bldgText)
                         println("--------------------------------------------------")
                     }
                 }
 
-                // 印出建物標的解析結果
+                // 印出建物標的雙語解析結果
                 if (buildingResults.isNotEmpty()) {
-                    println("\n🏢 「建物標的附表」明細 (共 ${buildingResults.size} 筆建物標的)：")
+                    println("\n🏢 「建物標的附表」明細 Building Target Table Details (共 ${buildingResults.size} 筆建物標的)：")
                     println("--------------------------------------------------")
                     for ((index, item) in buildingResults.withIndex()) {
-                        println("【建物標的 ${index + 1}】")
-                        println("  🏢 建號:     " + item.buildingNumber + " 建號")
-                        if (item.baseLocation.isNotBlank()) println("  📍 基地坐落: " + item.baseLocation)
+                        println("【建物標的 Building Target ${index + 1}】")
+                        println("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
+                        if (item.baseLocation.isNotBlank()) println("  📍 基地坐落 Base Location:     " + item.baseLocation)
+                        if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
                         println("--------------------------------------------------")
                     }
                 }
             }
         } catch (e: Exception) {
-            println("解析檔案 ${pdfFile.name} 時發生錯誤：" + e.message)
+            println("解析檔案 File ${pdfFile.name} 時發生錯誤 (Error parsing file)：" + e.message)
             e.printStackTrace()
         }
         println("\n")
     }
 
     println("==================================================")
-    println("✅ 所有 ${pdfFiles.size} 個 PDF 檔案批次解析完畢！")
+    println("✅ 所有 ${pdfFiles.size} 個 PDF 檔案批次解析完畢 (Batch Parsing Completed)！")
     println("==================================================")
 }
 
@@ -139,6 +145,22 @@ fun MatchResult.safeGroupValue(groupName: String): String {
     }
 }
 
+// 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2)
+fun extractRightScope(text: String): String {
+    val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分之\s*\d+""").find(text)
+    if (fractionMatch != null) {
+        return fractionMatch.value.replace(" ", "")
+    }
+    val slashMatch = Regex("""\d+/\d+""").find(text)
+    if (slashMatch != null) {
+        return slashMatch.value
+    }
+    if (text.contains("全部")) {
+        return "全部"
+    }
+    return ""
+}
+
 fun parseLandLocations(attachmentText: String): List<LandLocation> {
     val results = mutableListOf<LandLocation>()
     val lines = attachmentText.lines()
@@ -150,7 +172,7 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
         Regex("""(?:(?<county>[\u4e00-\u9fa5]{2,3}[縣市]))?\s*(?:(?<district>[\u4e00-\u9fa5]{2,4}[區市鎮鄉]))?\s*(?<section>[\u4e00-\u9fa5]{2,8})(?:段)?\s*(?:(?<subSection>[\u4e00-\u9fa50-9]+小段))?\s*(?<landNo>\d+(?:-\d+)?)\s*(?:地號)""")
     )
 
-    for (line in lines) {
+    for ((index, line) in lines.withIndex()) {
         val trimmed = line.trim()
 
         // 跨頁標記「(續上頁)」防護：忽略跨頁頁頭，不終止表格狀態
@@ -185,13 +207,19 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
                         !section.contains("備考") && !section.contains("坐落")) {
                         
                         val fullSection = section + "段"
+
+                        // 多檢視前後 1-2 行提取權利範圍 (因 PDF 文字可能分開一行印出分之或數字)
+                        val windowText = (index..minOf(index + 2, lines.size - 1)).joinToString(" ") { lines[it] }
+                        val scope = extractRightScope(windowText)
+
                         val item = LandLocation(
                             id = (results.size + 1).toString(),
                             county = county,
                             district = district,
                             section = fullSection,
                             subSection = subSection,
-                            landNumber = landNo
+                            landNumber = landNo,
+                            rightScope = scope
                         )
 
                         if (results.none { it.section == item.section && it.landNumber == item.landNumber }) {
@@ -211,13 +239,11 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
     val lines = attachmentText.lines()
 
     var isInsideBuildingTable = false
-    // 正則匹配建號行：項次(選填) + 建號數字(2-5位) + 後續基地坐落門牌
     val bldgRowRegex = Regex("""^(?:(?<itemNo>\d+)\s+)?(?<bldgNo>\d{2,5})\s+(?<rest>.*)$""")
 
-    for (line in lines) {
+    for ((index, line) in lines.withIndex()) {
         val trimmed = line.trim()
 
-        // 跨頁標記「(續上頁)」防護：忽略跨頁頁頭，不終止表格狀態
         if (trimmed.contains("續上頁") || trimmed.contains("續頁")) {
             continue
         }
@@ -226,13 +252,11 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             isInsideBuildingTable = true
         }
 
-        // 遇到拍賣點交或使用情形說明，結束建物表格
         if (isInsideBuildingTable && (trimmed.contains("使用情形") || trimmed.contains("點交情形") || trimmed.contains("點交否"))) {
             isInsideBuildingTable = false
         }
 
         if (isInsideBuildingTable) {
-            // 排除表格欄位標頭列與頁碼標籤列
             if (trimmed.contains("編號") || trimmed.contains("門牌") || trimmed.contains("備考") || 
                 trimmed.contains("公尺") || trimmed.contains("權利範圍") || trimmed.contains("第") && trimmed.contains("頁")) {
                 continue
@@ -243,15 +267,19 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
                 val bldgNo = match.safeGroupValue("bldgNo")
                 val rest = match.safeGroupValue("rest")
 
-                // 排除執字案號與無效數字
                 if (bldgNo.isNotBlank() && bldgNo.length in 2..5 && 
                     !bldgNo.startsWith("114") && !bldgNo.startsWith("115") && 
                     bldgNo != "122947" && bldgNo != "131969" && bldgNo != "133508" && bldgNo != "90563") {
                     
+                    // 多檢視前後 1-3 行提取建物權利範圍
+                    val windowText = (index..minOf(index + 3, lines.size - 1)).joinToString(" ") { lines[it] }
+                    val scope = extractRightScope(windowText)
+
                     val item = BuildingInfo(
                         id = (results.size + 1).toString(),
                         buildingNumber = bldgNo,
-                        baseLocation = rest
+                        baseLocation = rest,
+                        rightScope = scope
                     )
                     if (results.none { it.buildingNumber == item.buildingNumber }) {
                         results.add(item)
