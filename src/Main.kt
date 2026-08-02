@@ -13,6 +13,7 @@ data class LandLocation(
     val subSection: String,
     val landNumber: String,
     val rightScope: String = "",
+    val landMinimalPrice: String = "",
     val buildingNumbers: MutableList<String> = mutableListOf()
 )
 
@@ -21,7 +22,8 @@ data class BuildingInfo(
     val id: String,
     val buildingNumber: String,
     val baseLocation: String,
-    val rightScope: String = ""
+    val rightScope: String = "",
+    val buildingMinimalPrice: String = ""
 )
 
 fun main(args: Array<String>) {
@@ -90,6 +92,7 @@ fun main(args: Array<String>) {
                         println("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
                         println("  📌 地號 Land Number:            " + item.landNumber + " 地號 (Land No. " + item.landNumber + ")")
                         if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+                        if (item.landMinimalPrice.isNotBlank()) println("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
                         
                         val bldgText = if (item.buildingNumbers.isNotEmpty()) {
                             item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
@@ -110,6 +113,7 @@ fun main(args: Array<String>) {
                         println("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
                         if (item.baseLocation.isNotBlank()) println("  📍 基地坐落 Base Location:     " + item.baseLocation)
                         if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+                        if (item.buildingMinimalPrice.isNotBlank()) println("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
                         println("--------------------------------------------------")
                     }
                 }
@@ -161,6 +165,12 @@ fun extractRightScope(text: String): String {
     return ""
 }
 
+// 提取最低拍賣價格 (如：717,000元, 3,072,000元, 8,300,000元)
+fun extractMinimalPrice(text: String): String {
+    val priceMatch = Regex("""(?<!合計|保證金)(?<price>\d{1,3}(?:,\d{3})+\s*元|\d+\s*元)""").find(text)
+    return priceMatch?.value?.replace(" ", "") ?: ""
+}
+
 fun parseLandLocations(attachmentText: String): List<LandLocation> {
     val results = mutableListOf<LandLocation>()
     val lines = attachmentText.lines()
@@ -175,17 +185,14 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
     for ((index, line) in lines.withIndex()) {
         val trimmed = line.trim()
 
-        // 跨頁標記「(續上頁)」防護：忽略跨頁頁頭，不終止表格狀態
         if (trimmed.contains("續上頁") || trimmed.contains("續頁")) {
             continue
         }
 
-        // 遇見獨立的「土 地 坐 落」或「土地坐落」表格標題
         if (trimmed.contains("土地坐落") || (trimmed.contains("土") && trimmed.contains("地") && trimmed.contains("坐"))) {
             isInsideLandTable = true
         }
 
-        // 遇見建物標的標頭（建號），結束土地表格
         if (trimmed.contains("建號") || trimmed.contains("建 號") || trimmed.contains("建物面積")) {
             isInsideLandTable = false
         }
@@ -208,9 +215,10 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
                         
                         val fullSection = section + "段"
 
-                        // 多檢視前後 1-2 行提取權利範圍 (因 PDF 文字可能分開一行印出分之或數字)
-                        val windowText = (index..minOf(index + 2, lines.size - 1)).joinToString(" ") { lines[it] }
+                        // 多檢視後續 15 行提取權利範圍與最低拍賣價格
+                        val windowText = (index..minOf(index + 15, lines.size - 1)).joinToString(" ") { lines[it] }
                         val scope = extractRightScope(windowText)
+                        val price = extractMinimalPrice(windowText)
 
                         val item = LandLocation(
                             id = (results.size + 1).toString(),
@@ -219,7 +227,8 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
                             section = fullSection,
                             subSection = subSection,
                             landNumber = landNo,
-                            rightScope = scope
+                            rightScope = scope,
+                            landMinimalPrice = price
                         )
 
                         if (results.none { it.section == item.section && it.landNumber == item.landNumber }) {
@@ -271,15 +280,17 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
                     !bldgNo.startsWith("114") && !bldgNo.startsWith("115") && 
                     bldgNo != "122947" && bldgNo != "131969" && bldgNo != "133508" && bldgNo != "90563") {
                     
-                    // 多檢視前後 1-3 行提取建物權利範圍
-                    val windowText = (index..minOf(index + 3, lines.size - 1)).joinToString(" ") { lines[it] }
+                    // 多檢視後續 15 行提取建物權利範圍與最低拍賣價格
+                    val windowText = (index..minOf(index + 15, lines.size - 1)).joinToString(" ") { lines[it] }
                     val scope = extractRightScope(windowText)
+                    val price = extractMinimalPrice(windowText)
 
                     val item = BuildingInfo(
                         id = (results.size + 1).toString(),
                         buildingNumber = bldgNo,
                         baseLocation = rest,
-                        rightScope = scope
+                        rightScope = scope,
+                        buildingMinimalPrice = price
                     )
                     if (results.none { it.buildingNumber == item.buildingNumber }) {
                         results.add(item)
