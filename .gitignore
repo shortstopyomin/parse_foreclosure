@@ -2,6 +2,11 @@
 out/
 !**/src/main/**/out/
 !**/src/test/**/out/
+.idea/workspace.xml
+.idea/shelf/
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/sonarlint/
 
 ### Kotlin ###
 .kotlin
@@ -30,3 +35,4 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+*.DS_Store

@@ -28,9 +28,12 @@ data class BuildingInfo(
 )
 
 fun main(args: Array<String>) {
-    // 關閉 PDFBox / FontBox 冗長 Log
+    // 徹底關閉 PDFBox / FontBox 冗長 Log 與 Warning
+    System.setProperty("org.apache.commons.logging.Log", "org.apache.commons.logging.impl.NoOpLog")
     Logger.getLogger("org.apache.pdfbox").level = Level.OFF
     Logger.getLogger("org.apache.fontbox").level = Level.OFF
+    Logger.getLogger("org.apache.fontbox.ttf").level = Level.OFF
+    Logger.getLogger("org.apache.fontbox.ttf.CmapSubtable").level = Level.OFF
 
     println("==================================================")
     println("     法院拍賣公告 - 多檔案批次土地與建號解析器     ")
@@ -40,12 +43,12 @@ fun main(args: Array<String>) {
     val pdfFiles = if (args.isNotEmpty()) {
         args.map { File(it) }.filter { it.exists() && it.name.lowercase().endsWith(".pdf") }
     } else {
-        val projectDir = File("D:/projects/land_number_parse")
+        val projectDir = File(".")
         projectDir.listFiles { _, name -> name.lowercase().endsWith(".pdf") }?.sortedBy { it.name } ?: emptyList()
     }
 
     if (pdfFiles.isEmpty()) {
-        println("⚠️ 提示 (Notice)：未找到任何 PDF 檔案 (No PDF files found)。請將拍賣公告 PDF 檔放入 D:/projects/land_number_parse/ 目錄中。")
+        println("⚠️ 提示 (Notice)：未找到任何 PDF 檔案 (No PDF files found)。請將拍賣公告 PDF 檔放入專案目錄中。")
         return
     }
 
