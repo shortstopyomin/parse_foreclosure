@@ -1,4 +1,4 @@
-﻿import org.apache.pdfbox.pdmodel.PDDocument
+import org.apache.pdfbox.pdmodel.PDDocument
 import org.apache.pdfbox.text.PDFTextStripper
 import java.io.File
 import java.util.logging.Level
@@ -153,9 +153,9 @@ fun MatchResult.safeGroupValue(groupName: String): String {
 
 // 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2)
 fun extractRightScope(text: String): String {
-    val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分之\s*\d+""").find(text)
+    val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(text)
     if (fractionMatch != null) {
-        return fractionMatch.value.replace(" ", "")
+        return fractionMatch.value.replace(Regex("""\s+"""), "")
     }
     val slashMatch = Regex("""\d+/\d+""").find(text)
     if (slashMatch != null) {
@@ -201,7 +201,7 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
             isInsideLandTable = true
         }
 
-        if (trimmed.contains("建號") || trimmed.contains("建 號") || trimmed.contains("建物面積")) {
+        if (trimmed.contains("建號                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ") || trimmed.contains("建 號") || trimmed.contains("建物面積")) {
             isInsideLandTable = false
         }
 
