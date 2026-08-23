@@ -24,7 +24,8 @@ data class BuildingInfo(
     val baseLocation: String,
     val rightScope: String = "",
     val buildingMinimalPrice: String = "",
-    val totalFloors: Int? = null
+    val totalFloors: Int? = null,
+    val locatedFloor: String = ""
 )
 
 fun main(args: Array<String>) {
@@ -117,6 +118,7 @@ fun main(args: Array<String>) {
                         println("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
                         if (item.baseLocation.isNotBlank()) println("  📍 基地坐落 Base Location:     " + item.baseLocation)
                         if (item.totalFloors != null) println("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
+                        if (item.locatedFloor.isNotBlank()) println("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
                         if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
                         if (item.buildingMinimalPrice.isNotBlank()) println("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
                         println("--------------------------------------------------")
@@ -154,6 +156,60 @@ fun MatchResult.safeGroupValue(groupName: String): String {
     }
 }
 
+// 中文數字轉換為整數 (例如 "五" -> 5, "十二" -> 12, "14" -> 14)
+fun chineseNumberToInt(cn: String): Int? {
+    val trimmed = cn.trim()
+    trimmed.toIntOrNull()?.let { return it }
+    
+    val map = mapOf(
+        '零' to 0, '一' to 1, '二' to 2, '兩' to 2, '三' to 3, '四' to 4,
+        '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9
+    )
+    if (trimmed == "十") return 10
+    if (trimmed.startsWith("十")) {
+        val digit = map[trimmed.getOrNull(1)] ?: 0
+        return 10 + digit
+    }
+    if (trimmed.endsWith("十")) {
+        val digit = map[trimmed[0]] ?: 1
+        return digit * 10
+    }
+    if (trimmed.length == 3 && trimmed[1] == '十') {
+        val tens = map[trimmed[0]] ?: 1
+        val ones = map[trimmed[2]] ?: 0
+        return tens * 10 + ones
+    }
+    if (trimmed.length == 1 && map.containsKey(trimmed[0])) {
+        return map[trimmed[0]]
+    }
+    return null
+}
+
+// 格式化所在樓層為雙語字串
+fun formatLocatedFloor(floor: String): String {
+    val num = floor.toIntOrNull()
+    if (num != null) {
+        val ordinal = when {
+            num % 100 in 11..13 -> "${num}th"
+            num % 10 == 1 -> "${num}st"
+            num % 10 == 2 -> "${num}nd"
+            num % 10 == 3 -> "${num}rd"
+            else -> "${num}th"
+        }
+        return "$num 樓 ($ordinal Floor)"
+    }
+    if (floor.contains("~")) {
+        return "$floor 樓 (Floors $floor)"
+    }
+    if (floor.contains("地下")) {
+        return "$floor (Basement)"
+    }
+    if (floor.contains("頂")) {
+        return "$floor (Rooftop)"
+    }
+    return floor
+}
+
 // 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2)
 fun extractRightScope(text: String): String {
     val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(text)
@@ -176,10 +232,98 @@ fun extractMinimalPrice(text: String): String {
     return priceMatch?.value?.replace(" ", "") ?: ""
 }
 
-// 提取房屋層數 (如：14 層 樓 -> 14, 15層樓 -> 15, 4層 -> 4)
-fun extractTotalFloors(text: String): Int? {
-    val match = Regex("""(?<floors>\d+)\s*層(?:\s*樓)?""").find(text)
-    return match?.groups["floors"]?.value?.toIntOrNull()
+// 提取總樓層與所在樓層資訊
+fun extractFloorInfo(blockText: String): Pair<Int?, String> {
+    if (blockText.contains("共同使用部分") || blockText.contains("公設")) {
+        return Pair(null, "")
+    }
+
+    val compact = blockText.replace(Regex("""\s+"""), "")
+
+    // 1. 總樓層 (Total Floors): 例如 "14層樓", "15層樓", "4層樓", "5層樓"
+    var totalFloors: Int? = null
+    val totalFloorMatch = Regex("""(?<total>\d+|[一二三四五六七八九十]+)\s*層\s*樓""").find(blockText)
+    if (totalFloorMatch != null) {
+        val rawTotal = totalFloorMatch.groups["total"]?.value ?: ""
+        totalFloors = chineseNumberToInt(rawTotal)
+    }
+
+    // 2. 所在樓層 (Located Floor)
+    var locatedFloor: String = ""
+
+    // 策略 A: 「之第X層」或「之第X樓」 (例如 "之第12層", "之第10層")
+    val zhiMatch = Regex("""之第(?<loc>\d+|[一二三四五六七八九十]+)[層樓]""").find(compact)
+    if (zhiMatch != null) {
+        val rawLoc = zhiMatch.groups["loc"]?.value ?: ""
+        val num = chineseNumberToInt(rawLoc)
+        locatedFloor = num?.toString() ?: rawLoc
+    }
+
+    // 策略 B: 建物面積表中的「X層:」或「X樓層:」
+    if (locatedFloor.isBlank()) {
+        val basementMatch = Regex("""(?<bLevel>地下(?:\d+|[一二三四五六七八九十]+))\s*[層樓](?:\s*頂)?\s*:""").find(blockText)
+        if (basementMatch != null) {
+            val raw = basementMatch.groups["bLevel"]?.value ?: ""
+            val digitPart = raw.removePrefix("地下")
+            val num = chineseNumberToInt(digitPart)
+            locatedFloor = "地下" + (num ?: digitPart) + "樓"
+        }
+        
+        if (locatedFloor.isBlank()) {
+            val topMatch = Regex("""(?<top>(?:\d+|[一二三四五六七八九十]+))\s*層\s*頂(?:\s*未登記)?\s*:""").find(blockText)
+            if (topMatch != null) {
+                val raw = topMatch.groups["top"]?.value ?: ""
+                val num = chineseNumberToInt(raw)
+                locatedFloor = (num ?: raw).toString() + "樓頂未登記"
+            }
+        }
+
+        if (locatedFloor.isBlank()) {
+            val floorAreaMatches = Regex("""(?<fNum>(?:\d+|[一二三四五六七八九十]+))\s*(?:樓\s*層|層)\s*:""").findAll(blockText).toList()
+            if (floorAreaMatches.size > 1) {
+                val nums = floorAreaMatches.mapNotNull { chineseNumberToInt(it.groups["fNum"]?.value ?: "") }.sorted()
+                if (nums.isNotEmpty()) {
+                    locatedFloor = "${nums.first()}~${nums.last()}"
+                    if (totalFloors == null) {
+                        totalFloors = nums.maxOrNull()
+                    }
+                }
+            } else if (floorAreaMatches.size == 1) {
+                val raw = floorAreaMatches[0].groups["fNum"]?.value ?: ""
+                val num = chineseNumberToInt(raw)
+                locatedFloor = num?.toString() ?: raw
+            }
+        }
+    }
+
+    // 策略 C: 建物門牌中的「X號X樓」
+    if (locatedFloor.isBlank()) {
+        val doorBasementMatch = Regex("""號\s*(?<bLevel>地下(?:\d+|[一二三四五六七八九十]+))\s*[層樓]""").find(blockText)
+        if (doorBasementMatch != null) {
+            val raw = doorBasementMatch.groups["bLevel"]?.value?.replace(Regex("""\s+"""), "") ?: ""
+            val digitPart = raw.removePrefix("地下")
+            val num = chineseNumberToInt(digitPart)
+            locatedFloor = "地下" + (num ?: digitPart) + "樓"
+        }
+        if (locatedFloor.isBlank()) {
+            val doorTopMatch = Regex("""號\s*(?<top>(?:\d+|[一二三四五六七八九十]+)\s*[層樓]\s*頂(?:\s*未登記)?)""").find(blockText)
+            if (doorTopMatch != null) {
+                val raw = doorTopMatch.groups["top"]?.value?.replace(Regex("""\s+"""), "") ?: ""
+                val num = chineseNumberToInt(raw)
+                locatedFloor = (num ?: raw).toString() + "樓頂未登記"
+            }
+        }
+        if (locatedFloor.isBlank()) {
+            val doorMatch = Regex("""號\s*(?<loc>\d+|[一二三四五六七八九十]+)\s*[層樓]""").find(blockText)
+            if (doorMatch != null) {
+                val raw = doorMatch.groups["loc"]?.value ?: ""
+                val num = chineseNumberToInt(raw)
+                locatedFloor = num?.toString() ?: raw
+            }
+        }
+    }
+
+    return Pair(totalFloors, locatedFloor)
 }
 
 fun parseLandLocations(attachmentText: String): List<LandLocation> {
@@ -257,59 +401,64 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
     val results = mutableListOf<BuildingInfo>()
     val lines = attachmentText.lines()
 
-    var isInsideBuildingTable = false
+    var inBldg = false
+    val bldgIndices = mutableListOf<Pair<Int, String>>()
+    var endIdx = lines.size
     val bldgRowRegex = Regex("""^(?:(?<itemNo>\d+)\s+)?(?<bldgNo>\d{2,5})\s+(?<rest>.*)$""")
 
-    for ((index, line) in lines.withIndex()) {
+    for ((i, line) in lines.withIndex()) {
         val trimmed = line.trim()
-
-        if (trimmed.contains("續上頁") || trimmed.contains("續頁")) {
-            continue
+        if (trimmed.contains("建號") || trimmed.contains("建 號")) inBldg = true
+        if (inBldg && (trimmed.contains("使用情形") || trimmed.contains("點交情形") || trimmed.contains("點交否"))) {
+            inBldg = false
+            endIdx = i
+            break
         }
-
-        if (trimmed.contains("建號") || trimmed.contains("建 號") || trimmed.contains("建物面積") || trimmed.contains("建物門牌")) {
-            isInsideBuildingTable = true
-        }
-
-        if (isInsideBuildingTable && (trimmed.contains("使用情形") || trimmed.contains("點交情形") || trimmed.contains("點交否"))) {
-            isInsideBuildingTable = false
-        }
-
-        if (isInsideBuildingTable) {
+        if (inBldg) {
             if (trimmed.contains("編號") || trimmed.contains("門牌") || trimmed.contains("備考") || 
-                trimmed.contains("公尺") || trimmed.contains("權利範圍") || trimmed.contains("第") && trimmed.contains("頁")) {
+                trimmed.contains("公尺") || trimmed.contains("權利範圍") || (trimmed.contains("第") && trimmed.contains("頁"))) {
                 continue
             }
-
-            val match = bldgRowRegex.find(trimmed)
-            if (match != null) {
-                val bldgNo = match.safeGroupValue("bldgNo")
-                val rest = match.safeGroupValue("rest")
-
-                if (bldgNo.isNotBlank() && bldgNo.length in 2..5 && 
-                    !bldgNo.startsWith("114") && !bldgNo.startsWith("115") && 
-                    bldgNo != "122947" && bldgNo != "131969" && bldgNo != "133508" && bldgNo != "90563") {
-                    
-                    val windowText = (index..minOf(index + 15, lines.size - 1)).joinToString(" ") { lines[it] }
-                    val scope = extractRightScope(windowText)
-                    val price = extractMinimalPrice(windowText)
-                    val floors = extractTotalFloors(windowText)
-
-                    val item = BuildingInfo(
-                        id = (results.size + 1).toString(),
-                        buildingNumber = bldgNo,
-                        baseLocation = rest,
-                        rightScope = scope,
-                        buildingMinimalPrice = price,
-                        totalFloors = floors
-                    )
-                    if (results.none { it.buildingNumber == item.buildingNumber }) {
-                        results.add(item)
-                    }
+            val m = bldgRowRegex.find(trimmed)
+            if (m != null) {
+                val bldgNo = m.groups["bldgNo"]?.value ?: ""
+                if (bldgNo.length in 2..5 && !bldgNo.startsWith("114") && !bldgNo.startsWith("115") && 
+                    bldgNo !in listOf("122947", "131969", "133508", "90563")) {
+                    bldgIndices.add(Pair(i, bldgNo))
                 }
             }
         }
     }
 
+    for (k in bldgIndices.indices) {
+        val start = bldgIndices[k].first
+        val nextStart = if (k + 1 < bldgIndices.size) bldgIndices[k + 1].first else endIdx
+        val bldgNo = bldgIndices[k].second
+        val blockLines = (start until nextStart).map { lines[it] }
+        val blockText = blockLines.joinToString("\n")
+        
+        val firstLine = lines[start].trim()
+        val firstMatch = bldgRowRegex.find(firstLine)
+        val rest = firstMatch?.groups["rest"]?.value ?: ""
+
+        val scope = extractRightScope(blockText)
+        val price = extractMinimalPrice(blockText)
+        val (floors, located) = extractFloorInfo(blockText)
+
+        val item = BuildingInfo(
+            id = (results.size + 1).toString(),
+            buildingNumber = bldgNo,
+            baseLocation = rest,
+            rightScope = scope,
+            buildingMinimalPrice = price,
+            totalFloors = floors,
+            locatedFloor = located
+        )
+        if (results.none { it.buildingNumber == item.buildingNumber }) {
+            results.add(item)
+        }
+    }
+
     return results
 }
+
