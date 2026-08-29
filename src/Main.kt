@@ -224,17 +224,38 @@ fun formatBuildingType(type: String): String {
 
 // 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2)
 fun extractRightScope(text: String): String {
-    val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(text)
+    // 移除備考之後的文字，避免誤取備考欄位中的持分註記（例如：備考 各1/2、備考 各83/20000）
+    val textBeforeRemarks = if (text.contains("備考")) {
+        text.substringBefore("備考")
+    } else {
+        text
+    }
+
+    // 優先策略 1: 緊鄰最低拍賣價格前方的權利範圍 (例如 "全部 3,072,000元", "1分之1 2,816,000元", "10000分之61 948,000元")
+    val priceAdjacentRegex = Regex("""(?<scope>全部|\d+\s*(?:萬)?\s*分\s*之\s*\d+|\d+/\d+)\s+(?=\d{1,3}(?:,\d{3})+\s*元|\d+\s*元)""")
+    val adjacentMatch = priceAdjacentRegex.find(textBeforeRemarks) ?: priceAdjacentRegex.find(text)
+    if (adjacentMatch != null) {
+        return adjacentMatch.groups["scope"]!!.value.replace(Regex("""\s+"""), "")
+    }
+
+    // 策略 2: 中文分數格式 (例如 20000分之166, 100000分之264, 5分之1)
+    val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(textBeforeRemarks) 
+        ?: Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(text)
     if (fractionMatch != null) {
         return fractionMatch.value.replace(Regex("""\s+"""), "")
     }
-    val slashMatch = Regex("""\d+/\d+""").find(text)
+
+    // 策略 3: 「全部」
+    if (textBeforeRemarks.contains("全部") || text.contains("全部")) {
+        return "全部"
+    }
+
+    // 策略 4: 斜線分數 (例如 1/2)，需確保非日期格式
+    val slashMatch = Regex("""(?<!\d/)\b\d+/\d+\b(?!/\d)""").find(textBeforeRemarks)
     if (slashMatch != null) {
         return slashMatch.value
     }
-    if (text.contains("全部")) {
-        return "全部"
-    }
+
     return ""
 }
 
