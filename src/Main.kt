@@ -25,7 +25,8 @@ data class BuildingInfo(
     val rightScope: String = "",
     val buildingMinimalPrice: String = "",
     val totalFloors: Int? = null,
-    val locatedFloor: String = ""
+    val locatedFloor: String = "",
+    val buildingType: String = "" // "house", "elevator", "walk-up"
 )
 
 fun main(args: Array<String>) {
@@ -116,6 +117,7 @@ fun main(args: Array<String>) {
                     for ((index, item) in buildingResults.withIndex()) {
                         println("【建物標的 Building Target ${index + 1}】")
                         println("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
+                        if (item.buildingType.isNotBlank()) println("  🏠 建物型態 Building Type:     " + formatBuildingType(item.buildingType))
                         if (item.baseLocation.isNotBlank()) println("  📍 基地坐落 Base Location:     " + item.baseLocation)
                         if (item.totalFloors != null) println("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
                         if (item.locatedFloor.isNotBlank()) println("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
@@ -208,6 +210,16 @@ fun formatLocatedFloor(floor: String): String {
         return "$floor (Rooftop)"
     }
     return floor
+}
+
+// 格式化建物型態為雙語字串
+fun formatBuildingType(type: String): String {
+    return when (type.lowercase()) {
+        "house" -> "透天 (House / house)"
+        "elevator" -> "大樓 (Elevator Building / elevator)"
+        "walk-up" -> "公寓 (Walk-up Apartment / walk-up)"
+        else -> type
+    }
 }
 
 // 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2)
@@ -326,6 +338,62 @@ fun extractFloorInfo(blockText: String): Pair<Int?, String> {
     return Pair(totalFloors, locatedFloor)
 }
 
+/**
+ * 判斷建物型態:
+ * 1. house (透天): 總樓層 <= 5 且 樓層面積包含全棟/多樓層 (例如 1~4 樓)，或標示透天/別墅/整棟，或為透天厝之增建
+ * 2. elevator (大樓 / 電梯大樓): 總樓層 >= 6 (依法規設有電梯)，或明確標示大樓/華廈/電梯，或屬大樓之共同使用部分
+ * 3. walk-up (公寓): 總樓層 <= 5 且 僅持有單一特定樓層 (如 2樓、5樓、5樓頂未登記、之第X層)
+ */
+fun determineBuildingType(totalFloors: Int?, locatedFloor: String, blockText: String, primaryType: String? = null): String {
+    val isCommonArea = blockText.contains("共同使用部分") || blockText.contains("公設")
+    if (isCommonArea) {
+        return primaryType ?: "elevator"
+    }
+
+    // 計算面積欄位中出現的樓層數 (例如 一層: ..., 二層: ..., 三層: ...)
+    val areaFloorMatches = Regex("""(?:\d+|[一二三四五六七八九十]+)\s*(?:樓\s*層|層)\s*:""").findAll(blockText).toList()
+    val distinctAreaFloors = areaFloorMatches.size
+
+    // 規則 1: 關鍵字明確標註
+    if (blockText.contains("透天") || blockText.contains("別墅")) {
+        return "house"
+    }
+    if (blockText.contains("電梯") || blockText.contains("華廈") || blockText.contains("大廈")) {
+        return "elevator"
+    }
+    if (blockText.contains("公寓")) {
+        return "walk-up"
+    }
+
+    // 規則 2: 總樓層 >= 6 -> 大樓 (elevator)
+    if (totalFloors != null && totalFloors >= 6) {
+        return "elevator"
+    }
+
+    // 規則 3: 總樓層 <= 5
+    if (totalFloors != null && totalFloors <= 5) {
+        // 若樓層面積列出多個樓層 (例如 1~4層)，或所在樓層為範圍 (1~4 樓) -> 透天 (house)
+        if (distinctAreaFloors > 1 || locatedFloor.contains("~")) {
+            return "house"
+        }
+        // 若僅為單一樓層 (例如 5樓, 2樓, 地下1樓, 5樓頂未登記) -> 公寓 (walk-up)
+        return "walk-up"
+    }
+
+    // 規則 4: 若無總樓層資訊時（如增建物未登記）
+    if (distinctAreaFloors > 1 || locatedFloor.contains("~")) {
+        return "house"
+    }
+    if (primaryType != null) {
+        return primaryType
+    }
+    if (locatedFloor.isNotBlank()) {
+        return "walk-up"
+    }
+
+    return "elevator"
+}
+
 fun parseLandLocations(attachmentText: String): List<LandLocation> {
     val results = mutableListOf<LandLocation>()
     val lines = attachmentText.lines()
@@ -430,6 +498,7 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
         }
     }
 
+    var firstMainType: String? = null
     for (k in bldgIndices.indices) {
         val start = bldgIndices[k].first
         val nextStart = if (k + 1 < bldgIndices.size) bldgIndices[k + 1].first else endIdx
@@ -444,6 +513,10 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
         val scope = extractRightScope(blockText)
         val price = extractMinimalPrice(blockText)
         val (floors, located) = extractFloorInfo(blockText)
+        val bType = determineBuildingType(floors, located, blockText, firstMainType)
+        if (firstMainType == null && !blockText.contains("共同使用部分") && !blockText.contains("公設")) {
+            firstMainType = bType
+        }
 
         val item = BuildingInfo(
             id = (results.size + 1).toString(),
@@ -452,7 +525,8 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             rightScope = scope,
             buildingMinimalPrice = price,
             totalFloors = floors,
-            locatedFloor = located
+            locatedFloor = located,
+            buildingType = bType
         )
         if (results.none { it.buildingNumber == item.buildingNumber }) {
             results.add(item)
@@ -461,4 +535,5 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
 
     return results
 }
+
 
