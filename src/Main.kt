@@ -66,6 +66,13 @@ fun main(args: Array<String>) {
                 val stripper = PDFTextStripper()
                 val fullText = stripper.getText(document)
 
+                // 解析投標日與時間
+                val biddingDateTime = extractBiddingDateTime(fullText)
+                if (biddingDateTime.isNotBlank()) {
+                    println("⏰ 投標日時間 Bidding Date & Time: " + biddingDateTime)
+                    println("--------------------------------------------------")
+                }
+
                 // 直接跳到「附表：」之後的 Table 表格內文區塊
                 val attachmentText = getAttachmentText(fullText)
 
@@ -137,6 +144,56 @@ fun main(args: Array<String>) {
     println("==================================================")
     println("✅ 所有 ${pdfFiles.size} 個 PDF 檔案批次解析完畢 (Batch Parsing Completed)！")
     println("==================================================")
+}
+
+// 格式化投標日時間為標準格式 (例如: 115/09/10 14:30)
+fun formatBiddingDateTime(raw: String): String {
+    if (raw.isBlank()) return ""
+
+    val regex = Regex("""(?<year>\d{2,3})\s*年\s*(?<month>\d{1,2})\s*月\s*(?<day>\d{1,2})\s*日\s*(?:(?<period>上午|早上|下午|中午|晚上))?\s*(?<hour>\d{1,2})\s*(?:時|點)\s*(?:(?<minute>\d{1,2})\s*分|整)?""")
+    val match = regex.find(raw) ?: return raw
+
+    val year = match.groups["year"]?.value?.toIntOrNull() ?: return raw
+    val month = match.groups["month"]?.value?.toIntOrNull() ?: return raw
+    val day = match.groups["day"]?.value?.toIntOrNull() ?: return raw
+    val period = match.groups["period"]?.value ?: ""
+    var hour = match.groups["hour"]?.value?.toIntOrNull() ?: return raw
+    val minute = match.groups["minute"]?.value?.toIntOrNull() ?: 0
+
+    if (period in listOf("下午", "晚上")) {
+        if (hour < 12) {
+            hour += 12
+        }
+    } else if (period in listOf("上午", "早上")) {
+        if (hour == 12) {
+            hour = 0
+        }
+    }
+
+    return String.format("%d/%02d/%02d %02d:%02d", year, month, day, hour, minute)
+}
+
+// 提取投標日與時間並格式化為標準格式 (如：115/09/10 14:30)
+fun extractBiddingDateTime(fullText: String): String {
+    val normalized = fullText.lines().map { it.trim() }.joinToString(" ")
+
+    // 優先策略 1: 公告主文「投標日、時及場所：115年9月15日上午9時30分起」或「115年9月17日下午2時30分起」
+    val noticeRegex = Regex("""投標日[、，\s]*時(?:及場所)?[:：]\s*(?:中華民國)?\s*(?<datetime>\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*(?:上午|早上|下午|中午|晚上)?\s*\d{1,2}\s*(?:時|點)\s*(?:\d{1,2}\s*分)?(?:\s*起)?)""")
+    val match1 = noticeRegex.find(normalized)
+    if (match1 != null) {
+        val raw = match1.groups["datetime"]?.value?.replace(" ", "") ?: ""
+        return formatBiddingDateTime(raw)
+    }
+
+    // 策略 2: 備註欄「投標日期：中華民國115年9月16日下午2點30分到3點30分」
+    val remarksRegex = Regex("""投標日(?:期)?[:：]\s*(?:中華民國)?\s*(?<datetime>\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*(?:上午|早上|下午|中午|晚上)?\s*\d{1,2}\s*(?:時|點)\s*(?:\d{1,2}\s*分)?(?:\s*(?:到|至|起)\s*(?:上午|早上|下午|中午|晚上)?\s*\d{1,2}\s*(?:時|點)\s*(?:\d{1,2}\s*分)?)?)""")
+    val match2 = remarksRegex.find(normalized)
+    if (match2 != null) {
+        val raw = match2.groups["datetime"]?.value?.replace(" ", "") ?: ""
+        return formatBiddingDateTime(raw)
+    }
+
+    return ""
 }
 
 // 截取「附表：」開始的表格區塊，完全忽略前方公告條文
