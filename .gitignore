@@ -26,7 +26,13 @@ bin/
 ### NetBeans ###
 /nbproject/private/
 /nbbuild/
-/dist/
+# /dist/ is excluded by NetBeans convention, but we deliberately check in the compiled
+# parser jar there as a build artifact (see design.md's jar build strategy) — negating a
+# file inside an excluded directory doesn't work in gitignore, so the directory itself
+# must be un-excluded first.
+/dist/*
+!/dist/parser.jar
+!/dist/README.md
 /nbdist/
 /.nb-gradle/
 
