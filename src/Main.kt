@@ -29,6 +29,49 @@ data class BuildingInfo(
     val buildingType: String = "" // "house", "elevator", "walk-up"
 )
 
+/** Minimal dependency-free JSON string escaper for the fixed `--json` output schema below. */
+fun jsonEscape(s: String): String {
+    val sb = StringBuilder()
+    for (c in s) {
+        when (c) {
+            '"' -> sb.append("\\\"")
+            '\\' -> sb.append("\\\\")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            else -> if (c.code < 0x20) sb.append("\\u%04x".format(c.code)) else sb.append(c)
+        }
+    }
+    return sb.toString()
+}
+
+fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(s)}\""
+
+/**
+ * Emit the stable machine-readable contract for one PDF: bidding date/time (if found), and
+ * two independent arrays (land parcels, building units) with no field linking one to the
+ * other — `Main.kt`'s in-memory building-to-land cross-join (used below only to compose the
+ * human-readable console display) is intentionally NOT reflected here. See
+ * openspec/changes/replace-land-building-parser-with-kotlin/design.md D9 for why.
+ */
+fun printJson(biddingDateTime: String, landResults: List<LandLocation>, buildingResults: List<BuildingInfo>) {
+    val sb = StringBuilder()
+    sb.append("{")
+    sb.append("\"biddingDateTime\":${jsonString(biddingDateTime.ifBlank { null })},")
+    sb.append("\"landParcels\":[")
+    sb.append(landResults.mapIndexed { index, item ->
+        "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })},\"sortOrder\":$index}"
+    }.joinToString(","))
+    sb.append("],")
+    sb.append("\"buildingUnits\":[")
+    sb.append(buildingResults.mapIndexed { index, item ->
+        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })},\"sortOrder\":$index}"
+    }.joinToString(","))
+    sb.append("]")
+    sb.append("}")
+    println(sb.toString())
+}
+
 fun main(args: Array<String>) {
     // 徹底關閉 PDFBox / FontBox 冗長 Log 與 Warning
     System.setProperty("org.apache.commons.logging.Log", "org.apache.commons.logging.impl.NoOpLog")
@@ -37,13 +80,47 @@ fun main(args: Array<String>) {
     Logger.getLogger("org.apache.fontbox.ttf").level = Level.OFF
     Logger.getLogger("org.apache.fontbox.ttf.CmapSubtable").level = Level.OFF
 
+    val jsonMode = args.contains("--json")
+    val fileArgs = args.filter { it != "--json" }
+
+    if (jsonMode) {
+        // Single-PDF, machine-readable mode: exactly one JSON document to stdout, no console
+        // banner/decoration. A missing/unreadable file or parse error is a non-zero exit so
+        // the caller (api-core's subprocess client) treats it as a hard failure.
+        val pdfPath = fileArgs.firstOrNull()
+        if (pdfPath == null) {
+            System.err.println("Error: --json requires a PDF file path argument")
+            kotlin.system.exitProcess(1)
+        }
+        val pdfFile = File(pdfPath)
+        if (!pdfFile.exists()) {
+            System.err.println("Error: file not found: $pdfPath")
+            kotlin.system.exitProcess(1)
+        }
+        try {
+            PDDocument.load(pdfFile).use { document ->
+                val stripper = PDFTextStripper()
+                val fullText = stripper.getText(document)
+                val biddingDateTime = extractBiddingDateTime(fullText)
+                val attachmentText = getAttachmentText(fullText)
+                val landResults = parseLandLocations(attachmentText)
+                val buildingResults = parseBuildings(attachmentText)
+                printJson(biddingDateTime, landResults, buildingResults)
+            }
+        } catch (e: Exception) {
+            System.err.println("Error parsing file $pdfPath: ${e.message}")
+            kotlin.system.exitProcess(1)
+        }
+        return
+    }
+
     println("==================================================")
     println("     法院拍賣公告 - 多檔案批次土地與建號解析器     ")
     println("  Court Auction Announcement - Land & Building Parser  ")
     println("==================================================")
 
-    val pdfFiles = if (args.isNotEmpty()) {
-        args.map { File(it) }.filter { it.exists() && it.name.lowercase().endsWith(".pdf") }
+    val pdfFiles = if (fileArgs.isNotEmpty()) {
+        fileArgs.map { File(it) }.filter { it.exists() && it.name.lowercase().endsWith(".pdf") }
     } else {
         val projectDir = File(".")
         projectDir.listFiles { _, name -> name.lowercase().endsWith(".pdf") }?.sortedBy { it.name } ?: emptyList()
@@ -568,8 +645,7 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             val m = bldgRowRegex.find(trimmed)
             if (m != null) {
                 val bldgNo = m.groups["bldgNo"]?.value ?: ""
-                if (bldgNo.length in 2..5 && !bldgNo.startsWith("114") && !bldgNo.startsWith("115") && 
-                    bldgNo !in listOf("122947", "131969", "133508", "90563")) {
+                if (bldgNo.length in 2..5) {
                     bldgIndices.add(Pair(i, bldgNo))
                 }
             }
