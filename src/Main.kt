@@ -26,7 +26,9 @@ data class BuildingInfo(
     val buildingMinimalPrice: String = "",
     val totalFloors: Int? = null,
     val locatedFloor: String = "",
-    val buildingType: String = "" // "house", "elevator", "walk-up"
+    val buildingType: String = "", // "house", "elevator", "walk-up"
+    val buildingTypeRule: String = "", // which rule of determineBuildingType decided buildingType
+    val commonArea: Boolean = false // 共同使用部分 / 公設
 )
 
 /** Minimal dependency-free JSON string escaper for the fixed `--json` output schema below. */
@@ -53,8 +55,19 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * other — `Main.kt`'s in-memory building-to-land cross-join (used below only to compose the
  * human-readable console display) is intentionally NOT reflected here. See
  * openspec/changes/replace-land-building-parser-with-kotlin/design.md D9 for why.
+ *
+ * Also carries each building's floors and type (with the rule that decided it), a
+ * `property` summary of the main building, `warnings` for anything uncertain, and
+ * `report`: the same human-readable text console mode prints for this file
+ * (openspec/changes/kotlin-sole-parser).
  */
-fun printJson(biddingDateTime: String, landResults: List<LandLocation>, buildingResults: List<BuildingInfo>) {
+fun printJson(
+    biddingDateTime: String,
+    landResults: List<LandLocation>,
+    buildingResults: List<BuildingInfo>,
+    warnings: List<String>,
+    report: String
+) {
     val sb = StringBuilder()
     sb.append("{")
     sb.append("\"biddingDateTime\":${jsonString(biddingDateTime.ifBlank { null })},")
@@ -65,11 +78,78 @@ fun printJson(biddingDateTime: String, landResults: List<LandLocation>, building
     sb.append("],")
     sb.append("\"buildingUnits\":[")
     sb.append(buildingResults.mapIndexed { index, item ->
-        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })},\"sortOrder\":$index}"
+        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })},\"sortOrder\":$index," +
+            "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}}"
     }.joinToString(","))
-    sb.append("]")
+    sb.append("],")
+    val main = mainBuilding(buildingResults)
+    sb.append("\"property\":${if (main == null) "null" else "{${floorAndTypeJson(main)}}"},")
+    sb.append("\"warnings\":[${warnings.joinToString(",") { jsonString(it) }}],")
+    sb.append("\"report\":${jsonString(report)}")
     sb.append("}")
     println(sb.toString())
+}
+
+/** `totalFloors`, `locatedFloor`, `buildingType`, `buildingTypeRule` of one building as JSON members. */
+fun floorAndTypeJson(item: BuildingInfo): String =
+    "\"totalFloors\":${item.totalFloors ?: "null"}," +
+        "\"locatedFloor\":${jsonString(item.locatedFloor.ifBlank { null })}," +
+        "\"buildingType\":${jsonString(item.buildingType.ifBlank { null })}," +
+        "\"buildingTypeRule\":${jsonString(item.buildingTypeRule.ifBlank { null })}"
+
+/** The property's main building: the first one that isn't a common area (共同使用部分/公設). */
+fun mainBuilding(buildingResults: List<BuildingInfo>): BuildingInfo? =
+    buildingResults.firstOrNull { !it.commonArea }
+
+/**
+ * Things a reviewer should check for this PDF: missing sections or values, and building
+ * types that were guessed rather than read. Shown to admins next to the report.
+ */
+fun computeWarnings(
+    fullText: String,
+    biddingDateTime: String,
+    landResults: List<LandLocation>,
+    buildingResults: List<BuildingInfo>
+): List<String> {
+    val warnings = mutableListOf<String>()
+    if (!fullText.contains("附表")) {
+        warnings.add("找不到「附表」區塊，已解析全文 (No 附表 section found; parsed the whole document)")
+    }
+    if (landResults.isEmpty() && buildingResults.isEmpty()) {
+        warnings.add("未解析到任何土地或建物標的 (No land or building rows found)")
+    }
+    if (biddingDateTime.isBlank()) {
+        warnings.add("未解析到投標日時間 (No bidding date/time found)")
+    }
+    val main = mainBuilding(buildingResults)
+    if (buildingResults.isNotEmpty() && main == null) {
+        warnings.add("所有建物皆為共同使用部分，無主建物 (Every building row is a common area; no main building)")
+    }
+    if (main != null) {
+        when (main.buildingTypeRule) {
+            "default" -> warnings.add("主建物型態無任何依據，預設為大樓 (Main building type had no evidence; defaulted to elevator)")
+            "inherited" -> warnings.add("主建物型態沿用前一建物 (Main building type was inherited from an earlier building)")
+        }
+        if (main.totalFloors == null && main.locatedFloor.isBlank()) {
+            warnings.add("主建物未解析到樓層資訊 (No floor information found for the main building)")
+        } else if (main.totalFloors == null) {
+            warnings.add("主建物未解析到總樓層 (No total floor count found for the main building)")
+        }
+    }
+    return warnings
+}
+
+/** Link every building to every land row for the console display (see printJson for why JSON omits it). */
+fun linkBuildingsToLand(landResults: List<LandLocation>, buildingResults: List<BuildingInfo>) {
+    if (landResults.isNotEmpty()) {
+        for (building in buildingResults) {
+            for (land in landResults) {
+                if (!land.buildingNumbers.contains(building.buildingNumber)) {
+                    land.buildingNumbers.add(building.buildingNumber)
+                }
+            }
+        }
+    }
 }
 
 fun main(args: Array<String>) {
@@ -105,7 +185,10 @@ fun main(args: Array<String>) {
                 val attachmentText = getAttachmentText(fullText)
                 val landResults = parseLandLocations(attachmentText)
                 val buildingResults = parseBuildings(attachmentText)
-                printJson(biddingDateTime, landResults, buildingResults)
+                val warnings = computeWarnings(fullText, biddingDateTime, landResults, buildingResults)
+                linkBuildingsToLand(landResults, buildingResults)
+                val report = renderReport(biddingDateTime, landResults, buildingResults)
+                printJson(biddingDateTime, landResults, buildingResults, warnings, report)
             }
         } catch (e: Exception) {
             System.err.println("Error parsing file $pdfPath: ${e.message}")
@@ -145,10 +228,6 @@ fun main(args: Array<String>) {
 
                 // 解析投標日與時間
                 val biddingDateTime = extractBiddingDateTime(fullText)
-                if (biddingDateTime.isNotBlank()) {
-                    println("⏰ 投標日時間 Bidding Date & Time: " + biddingDateTime)
-                    println("--------------------------------------------------")
-                }
 
                 // 直接跳到「附表：」之後的 Table 表格內文區塊
                 val attachmentText = getAttachmentText(fullText)
@@ -157,59 +236,9 @@ fun main(args: Array<String>) {
                 val buildingResults = parseBuildings(attachmentText)
 
                 // 若有拍賣土地標的，將建號關聯至對應土地
-                if (landResults.isNotEmpty()) {
-                    for (building in buildingResults) {
-                        for (land in landResults) {
-                            if (!land.buildingNumbers.contains(building.buildingNumber)) {
-                                land.buildingNumbers.add(building.buildingNumber)
-                            }
-                        }
-                    }
-                }
+                linkBuildingsToLand(landResults, buildingResults)
 
-                // 印出土地標的雙語解析結果
-                if (landResults.isEmpty()) {
-                    println("ℹ️ 【提示 Notice】本案無拍賣土地標的（僅法拍建物）。")
-                    println("   No land target in this auction (Building only). 地號 Land Number: None")
-                } else {
-                    println("🎯 「土地標的附表」解析結果 Land Target Table Results (共 ${landResults.size} 筆土地標的)：")
-                    println("--------------------------------------------------")
-                    for ((index, item) in landResults.withIndex()) {
-                        println("【土地標的 Land Target ${index + 1}】")
-                        if (item.county.isNotBlank()) println("  📍 縣市 City/County:            " + item.county)
-                        if (item.district.isNotBlank()) println("  📍 鄉鎮市區 District:           " + item.district)
-                        println("  📍 段別 Section:                " + item.section)
-                        println("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
-                        println("  📌 地號 Land Number:            " + (if (item.landNumber.isBlank()) "None" else item.landNumber + " 地號 (Land No. " + item.landNumber + ")"))
-                        if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
-                        if (item.landMinimalPrice.isNotBlank()) println("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
-                        
-                        val bldgText = if (item.buildingNumbers.isNotEmpty()) {
-                            item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
-                        } else {
-                            "(無對應建號 No Corresponding Building Number)"
-                        }
-                        println("  🏢 對應建號 Building Number:   " + bldgText)
-                        println("--------------------------------------------------")
-                    }
-                }
-
-                // 印出建物標的雙語解析結果
-                if (buildingResults.isNotEmpty()) {
-                    println("\n🏢 「建物標的附表」明細 Building Target Table Details (共 ${buildingResults.size} 筆建物標的)：")
-                    println("--------------------------------------------------")
-                    for ((index, item) in buildingResults.withIndex()) {
-                        println("【建物標的 Building Target ${index + 1}】")
-                        println("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
-                        if (item.buildingType.isNotBlank()) println("  🏠 建物型態 Building Type:     " + formatBuildingType(item.buildingType))
-                        if (item.baseLocation.isNotBlank()) println("  📍 基地坐落 Base Location:     " + item.baseLocation)
-                        if (item.totalFloors != null) println("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
-                        if (item.locatedFloor.isNotBlank()) println("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
-                        if (item.rightScope.isNotBlank()) println("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
-                        if (item.buildingMinimalPrice.isNotBlank()) println("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
-                        println("--------------------------------------------------")
-                    }
-                }
+                print(renderReport(biddingDateTime, landResults, buildingResults))
             }
         } catch (e: Exception) {
             println("解析檔案 File ${pdfFile.name} 時發生錯誤 (Error parsing file)：" + e.message)
@@ -221,6 +250,71 @@ fun main(args: Array<String>) {
     println("==================================================")
     println("✅ 所有 ${pdfFiles.size} 個 PDF 檔案批次解析完畢 (Batch Parsing Completed)！")
     println("==================================================")
+}
+
+/**
+ * The human-readable bilingual result for one PDF: what console mode prints between the
+ * file header and footer, and what `--json` returns as `report`.
+ */
+fun renderReport(
+    biddingDateTime: String,
+    landResults: List<LandLocation>,
+    buildingResults: List<BuildingInfo>
+): String {
+    val out = StringBuilder()
+    fun line(s: String) {
+        out.append(s).append('\n')
+    }
+
+    if (biddingDateTime.isNotBlank()) {
+        line("⏰ 投標日時間 Bidding Date & Time: " + biddingDateTime)
+        line("--------------------------------------------------")
+    }
+
+    // 印出土地標的雙語解析結果
+    if (landResults.isEmpty()) {
+        line("ℹ️ 【提示 Notice】本案無拍賣土地標的（僅法拍建物）。")
+        line("   No land target in this auction (Building only). 地號 Land Number: None")
+    } else {
+        line("🎯 「土地標的附表」解析結果 Land Target Table Results (共 ${landResults.size} 筆土地標的)：")
+        line("--------------------------------------------------")
+        for ((index, item) in landResults.withIndex()) {
+            line("【土地標的 Land Target ${index + 1}】")
+            if (item.county.isNotBlank()) line("  📍 縣市 City/County:            " + item.county)
+            if (item.district.isNotBlank()) line("  📍 鄉鎮市區 District:           " + item.district)
+            line("  📍 段別 Section:                " + item.section)
+            line("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
+            line("  📌 地號 Land Number:            " + (if (item.landNumber.isBlank()) "None" else item.landNumber + " 地號 (Land No. " + item.landNumber + ")"))
+            if (item.rightScope.isNotBlank()) line("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+            if (item.landMinimalPrice.isNotBlank()) line("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
+            
+            val bldgText = if (item.buildingNumbers.isNotEmpty()) {
+                item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
+            } else {
+                "(無對應建號 No Corresponding Building Number)"
+            }
+            line("  🏢 對應建號 Building Number:   " + bldgText)
+            line("--------------------------------------------------")
+        }
+    }
+
+    // 印出建物標的雙語解析結果
+    if (buildingResults.isNotEmpty()) {
+        line("\n🏢 「建物標的附表」明細 Building Target Table Details (共 ${buildingResults.size} 筆建物標的)：")
+        line("--------------------------------------------------")
+        for ((index, item) in buildingResults.withIndex()) {
+            line("【建物標的 Building Target ${index + 1}】")
+            line("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
+            if (item.buildingType.isNotBlank()) line("  🏠 建物型態 Building Type:     " + formatBuildingType(item.buildingType))
+            if (item.baseLocation.isNotBlank()) line("  📍 基地坐落 Base Location:     " + item.baseLocation)
+            if (item.totalFloors != null) line("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
+            if (item.locatedFloor.isNotBlank()) line("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
+            if (item.rightScope.isNotBlank()) line("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+            if (item.buildingMinimalPrice.isNotBlank()) line("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
+            line("--------------------------------------------------")
+        }
+    }
+    return out.toString()
 }
 
 // 格式化投標日時間為標準格式 (例如: 115/09/10 14:30)
@@ -499,10 +593,14 @@ fun extractFloorInfo(blockText: String): Pair<Int?, String> {
  * 2. elevator (大樓 / 電梯大樓): 總樓層 >= 6 (依法規設有電梯)，或明確標示大樓/華廈/電梯，或屬大樓之共同使用部分
  * 3. walk-up (公寓): 總樓層 <= 5 且 僅持有單一特定樓層 (如 2樓、5樓、5樓頂未登記、之第X層)
  */
-fun determineBuildingType(totalFloors: Int?, locatedFloor: String, blockText: String, primaryType: String? = null): String {
+fun determineBuildingType(totalFloors: Int?, locatedFloor: String, blockText: String, primaryType: String? = null): String =
+    determineBuildingTypeWithRule(totalFloors, locatedFloor, blockText, primaryType).first
+
+/** Same decision as [determineBuildingType], plus the name of the rule that made it. */
+fun determineBuildingTypeWithRule(totalFloors: Int?, locatedFloor: String, blockText: String, primaryType: String? = null): Pair<String, String> {
     val isCommonArea = blockText.contains("共同使用部分") || blockText.contains("公設")
     if (isCommonArea) {
-        return primaryType ?: "elevator"
+        return Pair(primaryType ?: "elevator", if (primaryType != null) "common-area:inherited" else "common-area:default")
     }
 
     // 計算面積欄位中出現的樓層數 (例如 一層: ..., 二層: ..., 三層: ...)
@@ -510,43 +608,39 @@ fun determineBuildingType(totalFloors: Int?, locatedFloor: String, blockText: St
     val distinctAreaFloors = areaFloorMatches.size
 
     // 規則 1: 關鍵字明確標註
-    if (blockText.contains("透天") || blockText.contains("別墅")) {
-        return "house"
-    }
-    if (blockText.contains("電梯") || blockText.contains("華廈") || blockText.contains("大廈")) {
-        return "elevator"
-    }
+    listOf("透天", "別墅").firstOrNull { blockText.contains(it) }?.let { return Pair("house", "keyword:$it") }
+    listOf("電梯", "華廈", "大廈").firstOrNull { blockText.contains(it) }?.let { return Pair("elevator", "keyword:$it") }
     if (blockText.contains("公寓")) {
-        return "walk-up"
+        return Pair("walk-up", "keyword:公寓")
     }
 
     // 規則 2: 總樓層 >= 6 -> 大樓 (elevator)
     if (totalFloors != null && totalFloors >= 6) {
-        return "elevator"
+        return Pair("elevator", "floors>=6")
     }
 
     // 規則 3: 總樓層 <= 5
     if (totalFloors != null && totalFloors <= 5) {
         // 若樓層面積列出多個樓層 (例如 1~4層)，或所在樓層為範圍 (1~4 樓) -> 透天 (house)
         if (distinctAreaFloors > 1 || locatedFloor.contains("~")) {
-            return "house"
+            return Pair("house", "floors<=5:multi-floor")
         }
         // 若僅為單一樓層 (例如 5樓, 2樓, 地下1樓, 5樓頂未登記) -> 公寓 (walk-up)
-        return "walk-up"
+        return Pair("walk-up", "floors<=5:single-floor")
     }
 
     // 規則 4: 若無總樓層資訊時（如增建物未登記）
     if (distinctAreaFloors > 1 || locatedFloor.contains("~")) {
-        return "house"
+        return Pair("house", "no-floors:multi-floor")
     }
     if (primaryType != null) {
-        return primaryType
+        return Pair(primaryType, "inherited")
     }
     if (locatedFloor.isNotBlank()) {
-        return "walk-up"
+        return Pair("walk-up", "no-floors:located-floor")
     }
 
-    return "elevator"
+    return Pair("elevator", "default")
 }
 
 fun parseLandLocations(attachmentText: String): List<LandLocation> {
@@ -667,8 +761,9 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
         val scope = extractRightScope(blockText)
         val price = extractMinimalPrice(blockText)
         val (floors, located) = extractFloorInfo(blockText)
-        val bType = determineBuildingType(floors, located, blockText, firstMainType)
-        if (firstMainType == null && !blockText.contains("共同使用部分") && !blockText.contains("公設")) {
+        val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
+        val isCommonArea = blockText.contains("共同使用部分") || blockText.contains("公設")
+        if (firstMainType == null && !isCommonArea) {
             firstMainType = bType
         }
 
@@ -680,7 +775,9 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             buildingMinimalPrice = price,
             totalFloors = floors,
             locatedFloor = located,
-            buildingType = bType
+            buildingType = bType,
+            buildingTypeRule = bTypeRule,
+            commonArea = isCommonArea
         )
         if (results.none { it.buildingNumber == item.buildingNumber }) {
             results.add(item)
