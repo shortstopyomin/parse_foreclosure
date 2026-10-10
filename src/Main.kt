@@ -59,7 +59,8 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * Also carries each building's floors and type (with the rule that decided it), a
  * `property` summary of the main building, `warnings` for anything uncertain, and
  * `report`: the same human-readable text console mode prints for this file
- * (openspec/changes/kotlin-sole-parser).
+ * (openspec/changes/kotlin-sole-parser). Each land and building row carries its
+ * `minimalPrice` (最低拍賣價格) in whole 元, or null (bid-form-minimum-price-reference).
  */
 fun printJson(
     biddingDateTime: String,
@@ -73,12 +74,14 @@ fun printJson(
     sb.append("\"biddingDateTime\":${jsonString(biddingDateTime.ifBlank { null })},")
     sb.append("\"landParcels\":[")
     sb.append(landResults.mapIndexed { index, item ->
-        "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })},\"sortOrder\":$index}"
+        "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
+            "\"minimalPrice\":${priceToYuan(item.landMinimalPrice) ?: "null"},\"sortOrder\":$index}"
     }.joinToString(","))
     sb.append("],")
     sb.append("\"buildingUnits\":[")
     sb.append(buildingResults.mapIndexed { index, item ->
-        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })},\"sortOrder\":$index," +
+        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
+            "\"minimalPrice\":${priceToYuan(item.buildingMinimalPrice) ?: "null"},\"sortOrder\":$index," +
             "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}}"
     }.joinToString(","))
     sb.append("],")
@@ -89,6 +92,9 @@ fun printJson(
     sb.append("}")
     println(sb.toString())
 }
+
+/** A 最低拍賣價格 like "11,500,000元" as whole 元 (11500000), or null when there is none. */
+fun priceToYuan(price: String): Long? = price.replace(Regex("""[,\s元]"""), "").toLongOrNull()
 
 /** `totalFloors`, `locatedFloor`, `buildingType`, `buildingTypeRule` of one building as JSON members. */
 fun floorAndTypeJson(item: BuildingInfo): String =
