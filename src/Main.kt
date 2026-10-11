@@ -31,6 +31,12 @@ data class BuildingInfo(
     val commonArea: Boolean = false // 共同使用部分 / 公設
 )
 
+// 定義保證金結構：每一標別對應一筆保證金
+data class Deposit(
+    val batchNumber: String?,   // 標別 (例如 "1", "甲", "A")；PDF 未標示標別時為 null (即只有一個標)
+    val amount: String  // 保證金金額 (例如 "12,828,000元")
+)
+
 /** Minimal dependency-free JSON string escaper for the fixed `--json` output schema below. */
 fun jsonEscape(s: String): String {
     val sb = StringBuilder()
@@ -61,17 +67,27 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * `report`: the same human-readable text console mode prints for this file
  * (openspec/changes/kotlin-sole-parser). Each land and building row carries its
  * `minimalPrice` (最低拍賣價格) in whole 元, or null (bid-form-minimum-price-reference).
+ * `deposit` is the first 保證金 in whole 元 (or null); `deposits` lists every 保證金 in
+ * document order as `{"batchNumber": 標別 or null, "amount": 元}` — multi-標別 notices have one per 標;
+ * `batchNumber` is null when the PDF has no 標別 label (a single-batch notice).
  */
 fun printJson(
     biddingDateTime: String,
     landResults: List<LandLocation>,
     buildingResults: List<BuildingInfo>,
     warnings: List<String>,
-    report: String
+    report: String,
+    deposits: List<Deposit> = emptyList()
 ) {
     val sb = StringBuilder()
     sb.append("{")
     sb.append("\"biddingDateTime\":${jsonString(biddingDateTime.ifBlank { null })},")
+    sb.append("\"deposit\":${deposits.firstNotNullOfOrNull { priceToYuan(it.amount) } ?: "null"},")
+    sb.append("\"deposits\":[")
+    sb.append(deposits.joinToString(",") {
+        "{\"batchNumber\":${jsonString(it.batchNumber)},\"amount\":${priceToYuan(it.amount) ?: "null"}}"
+    })
+    sb.append("],")
     sb.append("\"landParcels\":[")
     sb.append(landResults.mapIndexed { index, item ->
         "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
@@ -115,7 +131,8 @@ fun computeWarnings(
     fullText: String,
     biddingDateTime: String,
     landResults: List<LandLocation>,
-    buildingResults: List<BuildingInfo>
+    buildingResults: List<BuildingInfo>,
+    deposits: List<Deposit> = emptyList()
 ): List<String> {
     val warnings = mutableListOf<String>()
     if (!fullText.contains("附表")) {
@@ -126,6 +143,17 @@ fun computeWarnings(
     }
     if (biddingDateTime.isBlank()) {
         warnings.add("未解析到投標日時間 (No bidding date/time found)")
+    }
+    if (deposits.isEmpty()) {
+        warnings.add("未解析到保證金 (No deposit amount found)")
+    } else if (deposits.size > 1) {
+        if (deposits.any { it.batchNumber == null }) {
+            warnings.add("多筆保證金中有未標示標別者 (Some deposits have no batch number)")
+        }
+        val dupBatches = deposits.mapNotNull { it.batchNumber }.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+        if (dupBatches.isNotEmpty()) {
+            warnings.add("同一標別出現多筆保證金: ${dupBatches.joinToString(", ")} (Multiple deposits found for the same batch number)")
+        }
     }
     val main = mainBuilding(buildingResults)
     if (buildingResults.isNotEmpty() && main == null) {
@@ -188,13 +216,14 @@ fun main(args: Array<String>) {
                 val stripper = PDFTextStripper()
                 val fullText = stripper.getText(document)
                 val biddingDateTime = extractBiddingDateTime(fullText)
+                val deposits = extractDeposits(extractPositionSortedText(document))
                 val attachmentText = getAttachmentText(fullText)
                 val landResults = parseLandLocations(attachmentText)
                 val buildingResults = parseBuildings(attachmentText)
-                val warnings = computeWarnings(fullText, biddingDateTime, landResults, buildingResults)
+                val warnings = computeWarnings(fullText, biddingDateTime, landResults, buildingResults, deposits)
                 linkBuildingsToLand(landResults, buildingResults)
-                val report = renderReport(biddingDateTime, landResults, buildingResults)
-                printJson(biddingDateTime, landResults, buildingResults, warnings, report)
+                val report = renderReport(biddingDateTime, landResults, buildingResults, deposits)
+                printJson(biddingDateTime, landResults, buildingResults, warnings, report, deposits)
             }
         } catch (e: Exception) {
             System.err.println("Error parsing file $pdfPath: ${e.message}")
@@ -235,6 +264,9 @@ fun main(args: Array<String>) {
                 // 解析投標日與時間
                 val biddingDateTime = extractBiddingDateTime(fullText)
 
+                // 解析保證金 (多標別時每一標各一筆；需用依版面位置排序的文字才能正確配對標別)
+                val deposits = extractDeposits(extractPositionSortedText(document))
+
                 // 直接跳到「附表：」之後的 Table 表格內文區塊
                 val attachmentText = getAttachmentText(fullText)
 
@@ -244,7 +276,7 @@ fun main(args: Array<String>) {
                 // 若有拍賣土地標的，將建號關聯至對應土地
                 linkBuildingsToLand(landResults, buildingResults)
 
-                print(renderReport(biddingDateTime, landResults, buildingResults))
+                print(renderReport(biddingDateTime, landResults, buildingResults, deposits))
             }
         } catch (e: Exception) {
             println("解析檔案 File ${pdfFile.name} 時發生錯誤 (Error parsing file)：" + e.message)
@@ -265,7 +297,8 @@ fun main(args: Array<String>) {
 fun renderReport(
     biddingDateTime: String,
     landResults: List<LandLocation>,
-    buildingResults: List<BuildingInfo>
+    buildingResults: List<BuildingInfo>,
+    deposits: List<Deposit> = emptyList()
 ): String {
     val out = StringBuilder()
     fun line(s: String) {
@@ -274,6 +307,18 @@ fun renderReport(
 
     if (biddingDateTime.isNotBlank()) {
         line("⏰ 投標日時間 Bidding Date & Time: " + biddingDateTime)
+        line("--------------------------------------------------")
+    }
+
+    if (deposits.size == 1 && deposits[0].batchNumber == null) {
+        // 未標示標別：只有一個標
+        line("💵 保證金 Deposit: " + deposits[0].amount)
+        line("--------------------------------------------------")
+    } else if (deposits.isNotEmpty()) {
+        line("💵 保證金 Deposit (共 ${deposits.size} 個標別 / ${deposits.size} batches):")
+        for (d in deposits) {
+            line("  標別 Batch Number ${d.batchNumber ?: "(未標示 unlabeled)"}: " + d.amount)
+        }
         line("--------------------------------------------------")
     }
 
@@ -499,6 +544,50 @@ fun extractMinimalPrice(text: String): String {
     return priceMatch?.value?.replace(" ", "") ?: ""
 }
 
+/**
+ * 依版面位置 (由上而下、由左而右) 排序後的全文。
+ * 多標別公告用預設順序抽字時，「標別: X」與其「保證金」可能前後錯置 (例如 標別4、標別5 連在一起)，
+ * 依位置排序後每個「標別」標題才會緊接著該標的內容與保證金。僅用於保證金配對，不影響其他解析。
+ */
+fun extractPositionSortedText(document: PDDocument): String {
+    val stripper = PDFTextStripper()
+    stripper.sortByPosition = true
+    return stripper.getText(document)
+}
+
+/** 全形英數轉半形並轉大寫 (例如 "１２" -> "12", "ａ" -> "A")。 */
+fun normalizeBatchNumber(raw: String): String =
+    raw.map { c -> if (c in '０'..'９' || c in 'Ａ'..'Ｚ' || c in 'ａ'..'ｚ') (c.code - 0xFEE0).toChar() else c }
+        .joinToString("").uppercase()
+
+/**
+ * 提取各標別的保證金 (如：「標別: 2 … 三、保證金新台幣：154,000元。」→ Deposit("2", "154,000元"))。
+ * 標別可為數字 (1, 2, 10)、天干 (甲乙丙丁…)、或英文字母 (A, B, C…)。
+ * 依文字順序掃描，每筆保證金歸屬於其前方最近出現的「標別」；若 PDF 未標示標別 (只有一個標)，batchNumber 為 null。
+ * 建議傳入 [extractPositionSortedText] 的結果，以確保標別與保證金順序正確。
+ */
+fun extractDeposits(text: String): List<Deposit> {
+    val batchRegex = Regex(
+        """標[ \t]*別[ \t]*[:：][ \t]*(?<batch>[0-9０-９]+|[甲乙丙丁戊己庚辛壬癸]|[A-Za-zＡ-Ｚａ-ｚ])(?![0-9０-９A-Za-zＡ-Ｚａ-ｚ])"""
+    )
+    val depositRegex = Regex(
+        """保\s*證\s*金\s*(?:金\s*額)?\s*[:：]?\s*(?:新\s*[台臺]\s*幣)?\s*[:：]?\s*(?<amount>\d{1,3}(?:,\d{3})+|\d+)\s*元"""
+    )
+
+    // 合併兩種事件並依出現位置排序
+    val events = (batchRegex.findAll(text).map { it.range.first to ("batch" to normalizeBatchNumber(it.groups["batch"]!!.value)) } +
+        depositRegex.findAll(text).map { it.range.first to ("deposit" to it.groups["amount"]!!.value + "元") })
+        .sortedBy { it.first }
+
+    val results = mutableListOf<Deposit>()
+    var currentBatch: String? = null
+    for ((_, event) in events) {
+        val (kind, value) = event
+        if (kind == "batch") currentBatch = value else results.add(Deposit(currentBatch, value))
+    }
+    return results
+}
+
 // 提取總樓層與所在樓層資訊
 fun extractFloorInfo(blockText: String): Pair<Int?, String> {
     if (blockText.contains("共同使用部分") || blockText.contains("公設")) {
@@ -507,9 +596,12 @@ fun extractFloorInfo(blockText: String): Pair<Int?, String> {
 
     val compact = blockText.replace(Regex("""\s+"""), "")
 
-    // 1. 總樓層 (Total Floors): 例如 "14層樓", "15層樓", "4層樓", "5層樓"
+    // 1. 總樓層 (Total Floors): 例如 "14層樓", "15層樓", "4層樓", "5層樓", "22層"
+    //    「樓」為可選；排除「第X層」「地下X層」「之X層」、樓層面積表「X層:」及「X層頂」
     var totalFloors: Int? = null
-    val totalFloorMatch = Regex("""(?<total>\d+|[一二三四五六七八九十]+)\s*層\s*樓""").find(blockText)
+    val totalFloorMatch = Regex(
+        """(?<![第下之\d一二三四五六七八九十])(?<total>\d+|[一二三四五六七八九十]+)\s*層(?:\s*樓)?(?!\s*[:：頂])"""
+    ).find(blockText)
     if (totalFloorMatch != null) {
         val rawTotal = totalFloorMatch.groups["total"]?.value ?: ""
         totalFloors = chineseNumberToInt(rawTotal)
