@@ -786,10 +786,26 @@ fun extractRemarks(text: String): String {
 }
 
 /**
- * 開標地點 (如：「開標日、時及場所：115年9月22日上午10時整在本院民事執行處投標室當眾開標」→ "本院民事執行處投標室")。
+ * 公告標題的法院名稱 (如：「臺灣新北地方法院公告(第二次拍賣)（稿）」→ "臺灣新北地方法院")；找不到為 ""。
+ */
+fun extractCourtName(text: String): String {
+    val compact = text.replace(Regex("""\s+"""), "")
+    val court = Regex("""(?:臺灣|台灣|福建)[^，。、：:「」（）()]{1,4}?地方法院""")
+    return (Regex(court.pattern + "(?=公告)").find(compact) ?: court.find(compact))?.value ?: ""
+}
+
+/**
+ * 開標地點 (如：「開標日、時及場所：115年9月22日上午10時整在本院民事執行處投標室當眾開標」
+ * → "臺灣新北地方法院民事執行處投標室"，「本院」換成公告標題的法院名稱)。
  * 公告寫「前開處所」或「地址同投標場所」時，補上投標場所的地點或地址。找不到為 ""。
  */
 fun extractOpeningPlace(text: String): String {
+    val place = extractRawOpeningPlace(text)
+    val court = extractCourtName(text)
+    return if (court.isBlank()) place else place.replace("本院", court)
+}
+
+fun extractRawOpeningPlace(text: String): String {
     val compact = text.replace(Regex("""\s+"""), "")
     val opening = Regex("""開標日[、，]?時及場所[:：].*?在(?<place>.+?)當眾開標""").find(compact)
         ?.groups?.get("place")?.value ?: return ""
