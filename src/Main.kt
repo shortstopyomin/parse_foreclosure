@@ -1,5 +1,6 @@
 import org.apache.pdfbox.pdmodel.PDDocument
 import org.apache.pdfbox.text.PDFTextStripper
+import org.apache.pdfbox.text.TextPosition
 import java.io.File
 import java.util.logging.Level
 import java.util.logging.Logger
@@ -31,10 +32,33 @@ data class BuildingInfo(
     val commonArea: Boolean = false // 共同使用部分 / 公設
 )
 
-// 定義保證金結構：每一標別對應一筆保證金
-data class Deposit(
-    val batchNumber: String?,   // 標別 (例如 "1", "甲", "A")；PDF 未標示標別時為 null (即只有一個標)
-    val amount: String  // 保證金金額 (例如 "12,828,000元")
+// 定義標別結構：一個標別是投標書上填一張的單位，底下有該標的土地、建物與金額
+data class Batch(
+    val batchNumber: String?,      // 標別 (例如 "1", "甲", "A")；PDF 未標示標別時為 null (即只有一個標)
+    val caseNumber: String,        // 案號 (例如 "115年司執字125891號")
+    val owner: String,             // 財產所有人 (同一案號的不同標別可能不同人)
+    val deposit: String,           // 保證金 (例如 "12,828,000元")
+    val minimalPriceTotal: String, // 拍賣最低價額合計 (例如 "42,760,000元")
+    val handover: String,          // 點交情形 (例如 "不點交")
+    val remarks: String,           // 備註
+    val landResults: List<LandLocation>,
+    val buildingResults: List<BuildingInfo>,
+    val warnings: List<String>
+) {
+    /** 本標別所有土地與建物最低拍賣價格的加總 (元)；未填價格的列以 0 計。 */
+    val landBuildingPriceSum: Long
+        get() = landResults.sumOf { priceToYuan(it.landMinimalPrice) ?: 0L } +
+            buildingResults.sumOf { priceToYuan(it.buildingMinimalPrice) ?: 0L }
+}
+
+// 定義拍賣公告結構：一份 PDF = 一個案號的拍賣公告，底下有一或多個標別
+data class Notice(
+    val caseNumber: String,
+    val owner: String,             // 各標別財產所有人皆相同時為該人，否則為 ""
+    val biddingDateTime: String,
+    val openingPlace: String,      // 開標地點
+    val batches: List<Batch>,
+    val warnings: List<String>     // 整份公告層級的警示 (各標別的警示在 Batch.warnings)
 )
 
 /** Minimal dependency-free JSON string escaper for the fixed `--json` output schema below. */
@@ -56,61 +80,74 @@ fun jsonEscape(s: String): String {
 fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(s)}\""
 
 /**
- * Emit the stable machine-readable contract for one PDF: bidding date/time (if found), and
- * two independent arrays (land parcels, building units) with no field linking one to the
- * other — `Main.kt`'s in-memory building-to-land cross-join (used below only to compose the
- * human-readable console display) is intentionally NOT reflected here. See
- * openspec/changes/replace-land-building-parser-with-kotlin/design.md D9 for why.
+ * Emit the stable machine-readable contract for one PDF, layered like the notice itself:
+ * the PDF-level fields (`caseNumber`, `owner`, `biddingDateTime`, `openingPlace`, `warnings`)
+ * and `batches`, one per 標別 — the unit a bid form is filled in for. `batchNumber` is null
+ * when the PDF has no 標別 label (a single-batch notice).
  *
- * Also carries each building's floors and type (with the rule that decided it), a
- * `property` summary of the main building, `warnings` for anything uncertain, and
- * `report`: the same human-readable text console mode prints for this file
- * (openspec/changes/kotlin-sole-parser). Each land and building row carries its
- * `minimalPrice` (最低拍賣價格) in whole 元, or null (bid-form-minimum-price-reference).
- * `deposit` is the first 保證金 in whole 元 (or null); `deposits` lists every 保證金 in
- * document order as `{"batchNumber": 標別 or null, "amount": 元}` — multi-標別 notices have one per 標;
- * `batchNumber` is null when the PDF has no 標別 label (a single-batch notice).
+ * Each batch carries its `deposit` (保證金) and `minimalPriceTotal` (拍賣最低價額合計) in whole
+ * 元 (or null), `landBuildingPriceSum` (the sum of its rows' minimal prices, which should equal
+ * `minimalPriceTotal`), `owner`, `handover` (點交情形), `remarks` (備註), its own `warnings`, and
+ * two independent arrays (land parcels, building units) with no field linking one to the other —
+ * the in-memory building-to-land cross-join (used only for the human-readable display) is
+ * intentionally NOT reflected here. See openspec/changes/replace-land-building-parser-with-kotlin/design.md D9.
+ * Each row carries its `minimalPrice` (最低拍賣價格) in whole 元, or null; each building its
+ * floors and type (with the rule that decided it), and `property` summarises the batch's main building.
+ *
+ * `report` is the same human-readable text console mode prints for this file.
  */
-fun printJson(
-    biddingDateTime: String,
-    landResults: List<LandLocation>,
-    buildingResults: List<BuildingInfo>,
-    warnings: List<String>,
-    report: String,
-    deposits: List<Deposit> = emptyList()
-) {
+fun printJson(notice: Notice, report: String) {
     val sb = StringBuilder()
     sb.append("{")
-    sb.append("\"biddingDateTime\":${jsonString(biddingDateTime.ifBlank { null })},")
-    sb.append("\"deposit\":${deposits.firstNotNullOfOrNull { priceToYuan(it.amount) } ?: "null"},")
-    sb.append("\"deposits\":[")
-    sb.append(deposits.joinToString(",") {
-        "{\"batchNumber\":${jsonString(it.batchNumber)},\"amount\":${priceToYuan(it.amount) ?: "null"}}"
-    })
+    sb.append("\"caseNumber\":${jsonString(notice.caseNumber.ifBlank { null })},")
+    sb.append("\"owner\":${jsonString(notice.owner.ifBlank { null })},")
+    sb.append("\"biddingDateTime\":${jsonString(notice.biddingDateTime.ifBlank { null })},")
+    sb.append("\"openingPlace\":${jsonString(notice.openingPlace.ifBlank { null })},")
+    sb.append("\"batches\":[")
+    sb.append(notice.batches.joinToString(",") { batchJson(it) })
     sb.append("],")
-    sb.append("\"landParcels\":[")
-    sb.append(landResults.mapIndexed { index, item ->
-        "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
-            "\"minimalPrice\":${priceToYuan(item.landMinimalPrice) ?: "null"},\"sortOrder\":$index}"
-    }.joinToString(","))
-    sb.append("],")
-    sb.append("\"buildingUnits\":[")
-    sb.append(buildingResults.mapIndexed { index, item ->
-        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
-            "\"minimalPrice\":${priceToYuan(item.buildingMinimalPrice) ?: "null"},\"sortOrder\":$index," +
-            "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}}"
-    }.joinToString(","))
-    sb.append("],")
-    val main = mainBuilding(buildingResults)
-    sb.append("\"property\":${if (main == null) "null" else "{${floorAndTypeJson(main)}}"},")
-    sb.append("\"warnings\":[${warnings.joinToString(",") { jsonString(it) }}],")
+    sb.append("\"warnings\":[${notice.warnings.joinToString(",") { jsonString(it) }}],")
     sb.append("\"report\":${jsonString(report)}")
     sb.append("}")
     println(sb.toString())
 }
 
+/** One 標別 as a JSON object (see [printJson]). */
+fun batchJson(batch: Batch): String {
+    val sb = StringBuilder()
+    sb.append("{")
+    sb.append("\"batchNumber\":${jsonString(batch.batchNumber)},")
+    sb.append("\"owner\":${jsonString(batch.owner.ifBlank { null })},")
+    sb.append("\"deposit\":${priceToYuan(batch.deposit) ?: "null"},")
+    sb.append("\"minimalPriceTotal\":${priceToYuan(batch.minimalPriceTotal) ?: "null"},")
+    sb.append("\"landBuildingPriceSum\":${batch.landBuildingPriceSum},")
+    sb.append("\"handover\":${jsonString(batch.handover.ifBlank { null })},")
+    sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
+    sb.append("\"landParcels\":[")
+    sb.append(batch.landResults.mapIndexed { index, item ->
+        "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
+            "\"minimalPrice\":${priceToYuan(item.landMinimalPrice) ?: "null"},\"sortOrder\":$index}"
+    }.joinToString(","))
+    sb.append("],")
+    sb.append("\"buildingUnits\":[")
+    sb.append(batch.buildingResults.mapIndexed { index, item ->
+        "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
+            "\"minimalPrice\":${priceToYuan(item.buildingMinimalPrice) ?: "null"},\"sortOrder\":$index," +
+            "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}}"
+    }.joinToString(","))
+    sb.append("],")
+    val main = mainBuilding(batch.buildingResults)
+    sb.append("\"property\":${if (main == null) "null" else "{${floorAndTypeJson(main)}}"},")
+    sb.append("\"warnings\":[${batch.warnings.joinToString(",") { jsonString(it) }}]")
+    sb.append("}")
+    return sb.toString()
+}
+
 /** A 最低拍賣價格 like "11,500,000元" as whole 元 (11500000), or null when there is none. */
 fun priceToYuan(price: String): Long? = price.replace(Regex("""[,\s元]"""), "").toLongOrNull()
+
+/** Whole 元 formatted like the PDF (42760000 -> "42,760,000元"). */
+fun formatYuan(amount: Long): String = "%,d元".format(amount)
 
 /** `totalFloors`, `locatedFloor`, `buildingType`, `buildingTypeRule` of one building as JSON members. */
 fun floorAndTypeJson(item: BuildingInfo): String =
@@ -124,35 +161,38 @@ fun mainBuilding(buildingResults: List<BuildingInfo>): BuildingInfo? =
     buildingResults.firstOrNull { !it.commonArea }
 
 /**
- * Things a reviewer should check for this PDF: missing sections or values, and building
- * types that were guessed rather than read. Shown to admins next to the report.
+ * Things a reviewer should check for one 標別: missing values, a 拍賣最低價額合計 that doesn't
+ * match the rows' prices (rows missing, or rows from another 標別), and building types that
+ * were guessed rather than read.
  */
-fun computeWarnings(
-    fullText: String,
-    biddingDateTime: String,
+fun computeBatchWarnings(
     landResults: List<LandLocation>,
     buildingResults: List<BuildingInfo>,
-    deposits: List<Deposit> = emptyList()
+    deposit: String,
+    minimalPriceTotal: String,
+    owner: String
 ): List<String> {
     val warnings = mutableListOf<String>()
-    if (!fullText.contains("附表")) {
-        warnings.add("找不到「附表」區塊，已解析全文 (No 附表 section found; parsed the whole document)")
-    }
     if (landResults.isEmpty() && buildingResults.isEmpty()) {
         warnings.add("未解析到任何土地或建物標的 (No land or building rows found)")
     }
-    if (biddingDateTime.isBlank()) {
-        warnings.add("未解析到投標日時間 (No bidding date/time found)")
+    if (owner.isBlank()) {
+        warnings.add("未解析到財產所有人 (No property owner found)")
     }
-    if (deposits.isEmpty()) {
+    if (deposit.isBlank()) {
         warnings.add("未解析到保證金 (No deposit amount found)")
-    } else if (deposits.size > 1) {
-        if (deposits.any { it.batchNumber == null }) {
-            warnings.add("多筆保證金中有未標示標別者 (Some deposits have no batch number)")
-        }
-        val dupBatches = deposits.mapNotNull { it.batchNumber }.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
-        if (dupBatches.isNotEmpty()) {
-            warnings.add("同一標別出現多筆保證金: ${dupBatches.joinToString(", ")} (Multiple deposits found for the same batch number)")
+    }
+    val total = priceToYuan(minimalPriceTotal)
+    if (total == null) {
+        warnings.add("未解析到拍賣最低價額合計 (No minimal price total found)")
+    } else {
+        val sum = landResults.sumOf { priceToYuan(it.landMinimalPrice) ?: 0L } +
+            buildingResults.sumOf { priceToYuan(it.buildingMinimalPrice) ?: 0L }
+        if (sum != total) {
+            warnings.add(
+                "土地+建物最低拍賣價格加總 = ${formatYuan(sum)}，但拍賣最低價額合計 = ${formatYuan(total)} " +
+                    "(Land + building prices sum to ${formatYuan(sum)}, but the minimal price total is ${formatYuan(total)})"
+            )
         }
     }
     val main = mainBuilding(buildingResults)
@@ -173,7 +213,37 @@ fun computeWarnings(
     return warnings
 }
 
-/** Link every building to every land row for the console display (see printJson for why JSON omits it). */
+/** Things a reviewer should check for the PDF as a whole (each 標別 has its own, see [computeBatchWarnings]). */
+fun computeNoticeWarnings(
+    sortedText: String,
+    biddingDateTime: String,
+    openingPlace: String,
+    batches: List<Batch>
+): List<String> {
+    val warnings = mutableListOf<String>()
+    if (!sortedText.contains("附表")) {
+        warnings.add("找不到「附表」區塊，已解析全文 (No 附表 section found; parsed the whole document)")
+    }
+    if (biddingDateTime.isBlank()) {
+        warnings.add("未解析到投標日時間 (No bidding date/time found)")
+    }
+    if (openingPlace.isBlank()) {
+        warnings.add("未解析到開標地點 (No bid opening place found)")
+    }
+    val caseNumbers = batches.map { it.caseNumber }.filter { it.isNotBlank() }.distinct()
+    if (caseNumbers.isEmpty()) {
+        warnings.add("未解析到案號 (No case number found)")
+    } else if (caseNumbers.size > 1) {
+        warnings.add("各標別的案號不一致: ${caseNumbers.joinToString(", ")} (Batches have different case numbers)")
+    }
+    val dupBatches = batches.mapNotNull { it.batchNumber }.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+    if (dupBatches.isNotEmpty()) {
+        warnings.add("同一標別出現多次: ${dupBatches.joinToString(", ")} (The same batch number appears more than once)")
+    }
+    return warnings
+}
+
+/** Link every building to every land row of the same 標別 for the console display (see printJson for why JSON omits it). */
 fun linkBuildingsToLand(landResults: List<LandLocation>, buildingResults: List<BuildingInfo>) {
     if (landResults.isNotEmpty()) {
         for (building in buildingResults) {
@@ -184,6 +254,51 @@ fun linkBuildingsToLand(landResults: List<LandLocation>, buildingResults: List<B
             }
         }
     }
+}
+
+/**
+ * 解析一份拍賣公告 PDF：先依版面位置取文字，截取附表後依「標別」切段，
+ * 每一段分別解析土地、建物、保證金、合計、點交情形與備註。
+ */
+fun parseNotice(document: PDDocument): Notice {
+    val fullText = PDFTextStripper().getText(document)
+    val sortedText = extractPositionSortedText(document)
+    val biddingDateTime = extractBiddingDateTime(fullText)
+    val openingPlace = extractOpeningPlace(sortedText)
+
+    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it) }
+    val caseNumber = batches.map { it.caseNumber }.firstOrNull { it.isNotBlank() } ?: ""
+    val owners = batches.map { it.owner }.filter { it.isNotBlank() }.distinct()
+    return Notice(
+        caseNumber = caseNumber,
+        owner = owners.singleOrNull() ?: "",
+        biddingDateTime = biddingDateTime,
+        openingPlace = openingPlace,
+        batches = batches,
+        warnings = computeNoticeWarnings(sortedText, biddingDateTime, openingPlace, batches)
+    )
+}
+
+/** 解析一個標別段落；土地與建物只在同一標別內對應。 */
+fun parseBatch(section: BatchSection): Batch {
+    val landResults = parseLandLocations(section.text)
+    val buildingResults = parseBuildings(section.text)
+    linkBuildingsToLand(landResults, buildingResults)
+    val (caseNumber, owner) = extractCaseNumberAndOwner(section.text)
+    val deposit = extractDeposit(section.text)
+    val minimalPriceTotal = extractMinimalPriceTotal(section.text)
+    return Batch(
+        batchNumber = section.batchNumber,
+        caseNumber = caseNumber,
+        owner = owner,
+        deposit = deposit,
+        minimalPriceTotal = minimalPriceTotal,
+        handover = extractHandover(section.text),
+        remarks = extractRemarks(section.text),
+        landResults = landResults,
+        buildingResults = buildingResults,
+        warnings = computeBatchWarnings(landResults, buildingResults, deposit, minimalPriceTotal, owner)
+    )
 }
 
 fun main(args: Array<String>) {
@@ -213,17 +328,8 @@ fun main(args: Array<String>) {
         }
         try {
             PDDocument.load(pdfFile).use { document ->
-                val stripper = PDFTextStripper()
-                val fullText = stripper.getText(document)
-                val biddingDateTime = extractBiddingDateTime(fullText)
-                val deposits = extractDeposits(extractPositionSortedText(document))
-                val attachmentText = getAttachmentText(fullText)
-                val landResults = parseLandLocations(attachmentText)
-                val buildingResults = parseBuildings(attachmentText)
-                val warnings = computeWarnings(fullText, biddingDateTime, landResults, buildingResults, deposits)
-                linkBuildingsToLand(landResults, buildingResults)
-                val report = renderReport(biddingDateTime, landResults, buildingResults, deposits)
-                printJson(biddingDateTime, landResults, buildingResults, warnings, report, deposits)
+                val notice = parseNotice(document)
+                printJson(notice, renderReport(notice))
             }
         } catch (e: Exception) {
             System.err.println("Error parsing file $pdfPath: ${e.message}")
@@ -254,31 +360,13 @@ fun main(args: Array<String>) {
     for ((fileIndex, pdfFile) in pdfFiles.withIndex()) {
         println("==================================================")
         println("📄 檔案 File [${fileIndex + 1}/${pdfFiles.size}]：${pdfFile.name}")
-        println("==================================================")
 
         try {
             PDDocument.load(pdfFile).use { document ->
-                val stripper = PDFTextStripper()
-                val fullText = stripper.getText(document)
-
-                // 解析投標日與時間
-                val biddingDateTime = extractBiddingDateTime(fullText)
-
-                // 解析保證金 (多標別時每一標各一筆；需用依版面位置排序的文字才能正確配對標別)
-                val deposits = extractDeposits(extractPositionSortedText(document))
-
-                // 直接跳到「附表：」之後的 Table 表格內文區塊
-                val attachmentText = getAttachmentText(fullText)
-
-                val landResults = parseLandLocations(attachmentText)
-                val buildingResults = parseBuildings(attachmentText)
-
-                // 若有拍賣土地標的，將建號關聯至對應土地
-                linkBuildingsToLand(landResults, buildingResults)
-
-                print(renderReport(biddingDateTime, landResults, buildingResults, deposits))
+                print(renderReport(parseNotice(document)))
             }
         } catch (e: Exception) {
+            println("==================================================")
             println("解析檔案 File ${pdfFile.name} 時發生錯誤 (Error parsing file)：" + e.message)
             e.printStackTrace()
         }
@@ -291,79 +379,102 @@ fun main(args: Array<String>) {
 }
 
 /**
- * The human-readable bilingual result for one PDF: what console mode prints between the
- * file header and footer, and what `--json` returns as `report`.
+ * The human-readable bilingual result for one PDF, in two levels: the PDF-level fields
+ * (case number, bidding date/time, opening place), then one block per 標別 with its
+ * deposit, minimal price total, land and building rows, remarks and warnings. Console mode
+ * prints it right after the file name line; `--json` returns it as `report`.
  */
-fun renderReport(
-    biddingDateTime: String,
-    landResults: List<LandLocation>,
-    buildingResults: List<BuildingInfo>,
-    deposits: List<Deposit> = emptyList()
-): String {
+fun renderReport(notice: Notice): String {
     val out = StringBuilder()
     fun line(s: String) {
         out.append(s).append('\n')
     }
+    val separator = "=================================================="
 
-    if (biddingDateTime.isNotBlank()) {
-        line("⏰ 投標日時間 Bidding Date & Time: " + biddingDateTime)
-        line("--------------------------------------------------")
-    }
+    // PDF 層 (一位債務人的一個拍賣案)
+    if (notice.caseNumber.isNotBlank()) line("   📁 案號 Case Number: " + notice.caseNumber)
+    if (notice.owner.isNotBlank()) line("   👤 財產所有人 Owner: " + notice.owner)
+    if (notice.biddingDateTime.isNotBlank()) line("   ⏰ 投標日時間 Bidding Date & Time: " + notice.biddingDateTime)
+    if (notice.openingPlace.isNotBlank()) line("   📍 開標地點 Opening Place: " + notice.openingPlace)
+    line("   📦 共 ${notice.batches.size} 個標別 (${notice.batches.size} batch${if (notice.batches.size == 1) "" else "es"})")
+    line(separator)
 
-    if (deposits.size == 1 && deposits[0].batchNumber == null) {
-        // 未標示標別：只有一個標
-        line("💵 保證金 Deposit: " + deposits[0].amount)
-        line("--------------------------------------------------")
-    } else if (deposits.isNotEmpty()) {
-        line("💵 保證金 Deposit (共 ${deposits.size} 個標別 / ${deposits.size} batches):")
-        for (d in deposits) {
-            line("  標別 Batch Number ${d.batchNumber ?: "(未標示 unlabeled)"}: " + d.amount)
+    // 標別層 (投標書一張填一個標別)
+    val showBatchOwner = notice.owner.isBlank()
+    for (batch in notice.batches) {
+        val title = "標別 Batch Number: ${batch.batchNumber ?: "(未標示)"}"
+        line("  ┌─ $title " + "─".repeat(maxOf(4, 44 - title.length)))
+        fun row(s: String = "") {
+            line(if (s.isEmpty()) "  │" else "  │ $s")
         }
-        line("--------------------------------------------------")
-    }
+        if (showBatchOwner && batch.owner.isNotBlank()) row("👤 財產所有人 Owner: " + batch.owner)
+        row("💵 保證金 Deposit: " + batch.deposit.ifBlank { "(未解析到 Not found)" })
+        val total = priceToYuan(batch.minimalPriceTotal)
+        val sum = batch.landBuildingPriceSum
+        val check = when {
+            total == null -> ""
+            total == sum -> " ✅ (土地+建物 Land+Building = ${formatYuan(sum)})"
+            else -> " ❌ (土地+建物 Land+Building = ${formatYuan(sum)})"
+        }
+        row("💰 拍賣最低價額合計 Minimal Price Total: " + batch.minimalPriceTotal.ifBlank { "(未解析到 Not found)" } + check)
+        if (batch.handover.isNotBlank()) row("📋 點交情形 Handover: " + batch.handover)
 
-    // 印出土地標的雙語解析結果
-    if (landResults.isEmpty()) {
-        line("ℹ️ 【提示 Notice】本案無拍賣土地標的（僅法拍建物）。")
-        line("   No land target in this auction (Building only). 地號 Land Number: None")
-    } else {
-        line("🎯 「土地標的附表」解析結果 Land Target Table Results (共 ${landResults.size} 筆土地標的)：")
-        line("--------------------------------------------------")
-        for ((index, item) in landResults.withIndex()) {
-            line("【土地標的 Land Target ${index + 1}】")
-            if (item.county.isNotBlank()) line("  📍 縣市 City/County:            " + item.county)
-            if (item.district.isNotBlank()) line("  📍 鄉鎮市區 District:           " + item.district)
-            line("  📍 段別 Section:                " + item.section)
-            line("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
-            line("  📌 地號 Land Number:            " + (if (item.landNumber.isBlank()) "None" else item.landNumber + " 地號 (Land No. " + item.landNumber + ")"))
-            if (item.rightScope.isNotBlank()) line("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
-            if (item.landMinimalPrice.isNotBlank()) line("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
-            
-            val bldgText = if (item.buildingNumbers.isNotEmpty()) {
-                item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
-            } else {
-                "(無對應建號 No Corresponding Building Number)"
+        // 該標別的土地
+        row()
+        if (batch.landResults.isEmpty()) {
+            row("ℹ️ 本標別無拍賣土地標的（僅法拍建物）。No land target in this batch (Building only).")
+        } else {
+            row("🎯 土地 Land (共 ${batch.landResults.size} 筆土地標的)：")
+            for ((index, item) in batch.landResults.withIndex()) {
+                row("【土地標的 Land Target ${index + 1}】")
+                if (item.county.isNotBlank()) row("  📍 縣市 City/County:            " + item.county)
+                if (item.district.isNotBlank()) row("  📍 鄉鎮市區 District:           " + item.district)
+                row("  📍 段別 Section:                " + item.section)
+                row("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
+                row("  📌 地號 Land Number:            " + (if (item.landNumber.isBlank()) "None" else item.landNumber + " 地號 (Land No. " + item.landNumber + ")"))
+                if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+                if (item.landMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
+                val bldgText = if (item.buildingNumbers.isNotEmpty()) {
+                    item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
+                } else {
+                    "(無對應建號 No Corresponding Building Number)"
+                }
+                row("  🏢 對應建號 Building Number:   " + bldgText)
             }
-            line("  🏢 對應建號 Building Number:   " + bldgText)
-            line("--------------------------------------------------")
         }
+
+        // 該標別的建物
+        if (batch.buildingResults.isNotEmpty()) {
+            row()
+            row("🏢 建物 Building (共 ${batch.buildingResults.size} 筆建物標的)：")
+            for ((index, item) in batch.buildingResults.withIndex()) {
+                row("【建物標的 Building Target ${index + 1}】")
+                row("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
+                if (item.buildingType.isNotBlank()) row("  🏠 建物型態 Building Type:     " + formatBuildingType(item.buildingType))
+                if (item.baseLocation.isNotBlank()) row("  📍 基地坐落 Base Location:     " + item.baseLocation)
+                if (item.totalFloors != null) row("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
+                if (item.locatedFloor.isNotBlank()) row("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
+                if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+                if (item.buildingMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
+            }
+        }
+
+        if (batch.remarks.isNotBlank()) {
+            row()
+            row("📝 備註 Remarks:")
+            for (r in batch.remarks.lines()) row("  " + r)
+        }
+        if (batch.warnings.isNotEmpty()) {
+            row()
+            row("⚠️ 警示 Warnings:")
+            for (w in batch.warnings) row("  - " + w)
+        }
+        line("  └" + "─".repeat(48))
     }
 
-    // 印出建物標的雙語解析結果
-    if (buildingResults.isNotEmpty()) {
-        line("\n🏢 「建物標的附表」明細 Building Target Table Details (共 ${buildingResults.size} 筆建物標的)：")
-        line("--------------------------------------------------")
-        for ((index, item) in buildingResults.withIndex()) {
-            line("【建物標的 Building Target ${index + 1}】")
-            line("  🏢 建號 Building Number:       " + item.buildingNumber + " 建號 (Building No. " + item.buildingNumber + ")")
-            if (item.buildingType.isNotBlank()) line("  🏠 建物型態 Building Type:     " + formatBuildingType(item.buildingType))
-            if (item.baseLocation.isNotBlank()) line("  📍 基地坐落 Base Location:     " + item.baseLocation)
-            if (item.totalFloors != null) line("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
-            if (item.locatedFloor.isNotBlank()) line("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
-            if (item.rightScope.isNotBlank()) line("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
-            if (item.buildingMinimalPrice.isNotBlank()) line("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
-            line("--------------------------------------------------")
-        }
+    if (notice.warnings.isNotEmpty()) {
+        line("⚠️ 整份公告警示 Notice Warnings:")
+        for (w in notice.warnings) line("  - " + w)
     }
     return out.toString()
 }
@@ -416,16 +527,6 @@ fun extractBiddingDateTime(fullText: String): String {
     }
 
     return ""
-}
-
-// 截取「附表：」開始的表格區塊，完全忽略前方公告條文
-fun getAttachmentText(fullText: String): String {
-    val attachmentIndex = fullText.indexOf("附表")
-    return if (attachmentIndex != -1) {
-        fullText.substring(attachmentIndex)
-    } else {
-        fullText
-    }
 }
 
 // 安全取得 MatchResult 命名群組值
@@ -538,6 +639,27 @@ fun extractRightScope(text: String): String {
     return ""
 }
 
+/**
+ * 依版面位置排序後，權利範圍欄常被最低拍賣價格欄截斷：分母留在該列價格之前
+ * (「10000分之 5,950,000元」「100000 分 1,415,000元」)，分子落在下一行的行尾
+ * (「166」「之249」「… 合計: 616.38 467」)。從該列價格前的片段接起後續各行的行尾片段。
+ * 該列價格前已是完整的權利範圍 (「全部」「1分之1」) 時直接採用；拼不出「X分之Y」則回傳 ""。
+ */
+fun extractSplitRightScope(lines: List<String>, rowIndex: Int): String {
+    val price = """(?:\d{1,3}(?:,\d{3})+|\d+)\s*元"""
+    val row = lines[rowIndex].trim()
+    val complete = Regex("""(?<scope>全部|\d+\s*分\s*之\s*\d+|\d+/\d+)\s+$price""").find(row)
+    if (complete != null) return complete.groups["scope"]!!.value.replace(Regex("""\s+"""), "")
+    val partial = Regex("""(?<![\d.,])(?<frag>\d+\s*分\s*之?|\d+)\s+$price""").find(row) ?: return ""
+    val scope = StringBuilder(partial.groups["frag"]!!.value.replace(Regex("""\s+"""), ""))
+    for (i in rowIndex + 1 until minOf(rowIndex + 4, lines.size)) {
+        val lastToken = lines[i].trim().split(Regex("""\s+""")).last()
+        if (!lastToken.matches(Regex("""[\d分之]+"""))) break
+        scope.append(lastToken)
+    }
+    return scope.toString().takeIf { it.matches(Regex("""\d+分之\d+""")) } ?: ""
+}
+
 // 提取最低拍賣價格 (如：717,000元, 3,072,000元, 8,300,000元)
 fun extractMinimalPrice(text: String): String {
     val priceMatch = Regex("""(?<!合計|保證金)(?<price>\d{1,3}(?:,\d{3})+\s*元|\d+\s*元)""").find(text)
@@ -545,47 +667,154 @@ fun extractMinimalPrice(text: String): String {
 }
 
 /**
- * 依版面位置 (由上而下、由左而右) 排序後的全文。
- * 多標別公告用預設順序抽字時，「標別: X」與其「保證金」可能前後錯置 (例如 標別4、標別5 連在一起)，
- * 依位置排序後每個「標別」標題才會緊接著該標的內容與保證金。僅用於保證金配對，不影響其他解析。
+ * 依版面位置 (由上而下、由左而右) 排序後的全文，並清掉不屬於內文的雜訊：
+ * 左邊界的行號 (01、02…，皆位於頁面最左側)、頁碼 (「第三頁」) 與「(續上頁)」。
+ * 多標別公告用預設順序抽字時，「標別: X」標題會與內容錯置 (例如 標別4、標別5 連在一起)；
+ * 依位置排序後每個標題才會緊接著該標的內容，才能依標別切段 (見 [splitBatches])。
  */
 fun extractPositionSortedText(document: PDDocument): String {
-    val stripper = PDFTextStripper()
+    val stripper = object : PDFTextStripper() {
+        override fun writeString(text: String, textPositions: List<TextPosition>) {
+            val isMarginLineNumber = text.trim().matches(Regex("""\d{1,2}""")) &&
+                textPositions.all { it.xDirAdj < MARGIN_LINE_NUMBER_MAX_X }
+            if (!isMarginLineNumber) super.writeString(text, textPositions)
+        }
+    }
     stripper.sortByPosition = true
-    return stripper.getText(document)
+    return stripper.getText(document).lines()
+        .map { it.trim() }
+        .filterNot { it.matches(Regex("""第[一二三四五六七八九十\d]{1,4}頁|[(（]續上頁[)）]""")) }
+        .joinToString("\n")
 }
+
+/** 左邊界行號的 x 座標上限 (行號約在 x=41，內文自 x≈67 起)。 */
+const val MARGIN_LINE_NUMBER_MAX_X = 60f
 
 /** 全形英數轉半形並轉大寫 (例如 "１２" -> "12", "ａ" -> "A")。 */
 fun normalizeBatchNumber(raw: String): String =
     raw.map { c -> if (c in '０'..'９' || c in 'Ａ'..'Ｚ' || c in 'ａ'..'ｚ') (c.code - 0xFEE0).toChar() else c }
         .joinToString("").uppercase()
 
+/** 「標別: X」標題。X 可為數字 (1, 2, 10)、天干 (甲乙丙丁…)、或英文字母 (A, B, C…)。 */
+val BATCH_HEADER_REGEX = Regex(
+    """標[ \t]*別[ \t]*[:：][ \t]*(?<batch>[0-9０-９]+|[甲乙丙丁戊己庚辛壬癸]|[A-Za-zＡ-Ｚａ-ｚ])(?![0-9０-９A-Za-zＡ-Ｚａ-ｚ])"""
+)
+
 /**
- * 提取各標別的保證金 (如：「標別: 2 … 三、保證金新台幣：154,000元。」→ Deposit("2", "154,000元"))。
- * 標別可為數字 (1, 2, 10)、天干 (甲乙丙丁…)、或英文字母 (A, B, C…)。
- * 依文字順序掃描，每筆保證金歸屬於其前方最近出現的「標別」；若 PDF 未標示標別 (只有一個標)，batchNumber 為 null。
- * 建議傳入 [extractPositionSortedText] 的結果，以確保標別與保證金順序正確。
+ * 附表區塊：自「附表：」(附表表格的標題) 起；找不到時退回第一個「附表」，再找不到則為全文。
+ * 公告正文的「均詳如附表。」不帶冒號，不會被當成附表起點。
  */
-fun extractDeposits(text: String): List<Deposit> {
-    val batchRegex = Regex(
-        """標[ \t]*別[ \t]*[:：][ \t]*(?<batch>[0-9０-９]+|[甲乙丙丁戊己庚辛壬癸]|[A-Za-zＡ-Ｚａ-ｚ])(?![0-9０-９A-Za-zＡ-Ｚａ-ｚ])"""
-    )
-    val depositRegex = Regex(
-        """保\s*證\s*金\s*(?:金\s*額)?\s*[:：]?\s*(?:新\s*[台臺]\s*幣)?\s*[:：]?\s*(?<amount>\d{1,3}(?:,\d{3})+|\d+)\s*元"""
-    )
+fun getAttachmentText(fullText: String): String {
+    val start = Regex("""附\s*表\s*[:：]""").find(fullText)?.range?.first
+        ?: fullText.indexOf("附表").takeIf { it != -1 }
+        ?: 0
+    return fullText.substring(start)
+}
 
-    // 合併兩種事件並依出現位置排序
-    val events = (batchRegex.findAll(text).map { it.range.first to ("batch" to normalizeBatchNumber(it.groups["batch"]!!.value)) } +
-        depositRegex.findAll(text).map { it.range.first to ("deposit" to it.groups["amount"]!!.value + "元") })
-        .sortedBy { it.first }
+/** 附表中的一個標別段落：標別 (未標示為 null) 與該標別的附表文字。 */
+data class BatchSection(val batchNumber: String?, val text: String)
 
-    val results = mutableListOf<Deposit>()
-    var currentBatch: String? = null
-    for ((_, event) in events) {
-        val (kind, value) = event
-        if (kind == "batch") currentBatch = value else results.add(Deposit(currentBatch, value))
+/**
+ * 依「標別: X」把附表切成一段一段，每段為一個可投標的標別。
+ * 沒有任何標別標題時 (只有一個標)，整個附表為一段，batchNumber 為 null。
+ * 需傳入 [extractPositionSortedText] 的附表，標題才會在正確位置。
+ */
+fun splitBatches(attachmentText: String): List<BatchSection> {
+    val headers = BATCH_HEADER_REGEX.findAll(attachmentText).toList()
+    if (headers.isEmpty()) return listOf(BatchSection(null, attachmentText))
+    return headers.mapIndexed { i, m ->
+        val end = if (i + 1 < headers.size) headers[i + 1].range.first else attachmentText.length
+        BatchSection(normalizeBatchNumber(m.groups["batch"]!!.value), attachmentText.substring(m.range.last + 1, end))
     }
-    return results
+}
+
+/** 保證金金額 (如：「三、保證金新台幣：154,000元。」→ "154,000元")；找不到為 ""。 */
+fun extractDeposit(text: String): String =
+    Regex("""保\s*證\s*金\s*(?:金\s*額)?\s*[:：]?\s*(?:新\s*[台臺]\s*幣)?\s*[:：]?\s*(?<amount>\d{1,3}(?:,\d{3})+|\d+)\s*元""")
+        .find(text)?.let { it.groups["amount"]!!.value + "元" } ?: ""
+
+/** 拍賣最低價額合計 (如：「二、拍賣最低價額合計新台幣：42,760,000元」→ "42,760,000元")；找不到為 ""。 */
+fun extractMinimalPriceTotal(text: String): String =
+    Regex("""最\s*低\s*(?:拍\s*賣\s*)?價\s*額?\s*合\s*計\s*(?:新\s*[台臺]\s*幣)?\s*[:：]?\s*(?<amount>\d{1,3}(?:,\d{3})+|\d+)\s*元""")
+        .find(text)?.let { it.groups["amount"]!!.value + "元" } ?: ""
+
+/**
+ * 附表表頭的案號與財產所有人 (如：「115年司執字125891號 財產所有人：蕭宇筌」)。
+ * 所有人過長時會折到下一行 (例如「…高小恬、高」「鈺貴、高玉玲」)，接到表格標題 (「編」) 之前為止。
+ */
+fun extractCaseNumberAndOwner(text: String): Pair<String, String> {
+    val lines = text.lines()
+    val headerRegex = Regex("""(?<case>\d{2,3}\s*年\s*度?\s*\S{0,8}?字\s*第?\s*\d+\s*號)\s*(?:財\s*產\s*所\s*有\s*人|債\s*務\s*人)\s*[:：]\s*(?<owner>.*)$""")
+    for ((i, line) in lines.withIndex()) {
+        val m = headerRegex.find(line) ?: continue
+        val owner = StringBuilder(m.groups["owner"]!!.value.trim())
+        var j = i + 1
+        while (j < lines.size && owner.isNotEmpty() && isOwnerContinuation(lines[j])) {
+            owner.append(lines[j].trim())
+            j++
+        }
+        return Pair(m.groups["case"]!!.value.replace(Regex("""\s+"""), ""), owner.toString())
+    }
+    return Pair("", "")
+}
+
+/** 財產所有人折行的延續：只有人名與頓號，且不是表格標題 (「編 土地坐落…」「編號 建號…」)。 */
+fun isOwnerContinuation(line: String): Boolean {
+    val t = line.trim()
+    return t.isNotEmpty() && !t.startsWith("編") && t.matches(Regex("""[一-龥A-Za-z、，()（）]+"""))
+}
+
+/** 點交情形 (如：「點交情形 點交否: 不點交」→ "不點交")；找不到為 ""。 */
+fun extractHandover(text: String): String =
+    Regex("""點\s*交\s*否\s*[:：]?\s*(?<value>[^\n]+)""").find(text)?.groups?.get("value")?.value?.trim() ?: ""
+
+/**
+ * 備註欄 (如：「備註 一、上開不動產3宗合併拍賣…」起，到公告結尾的承辦資訊之前)；找不到為 ""。
+ * 每一行保留原本的折行。
+ */
+fun extractRemarks(text: String): String {
+    val lines = text.lines()
+    val start = lines.indexOfFirst { it.trim().matches(Regex("""備\s*註.*""")) }
+    if (start == -1) return ""
+    val footer = Regex("""^(?:函\s*稿|股\s*別|擬\s*判|民\s*事\s*執\s*行\s*處|司\s*法\s*事\s*務\s*官|書\s*記\s*官|法\s*官)""")
+    return lines.drop(start)
+        .map { it.trim() }
+        .takeWhile { !footer.containsMatchIn(it) }
+        .mapIndexed { i, l -> if (i == 0) l.replace(Regex("""^備\s*註\s*"""), "") else l }
+        .filter { it.isNotBlank() }
+        .joinToString("\n")
+}
+
+/**
+ * 公告標題的法院名稱 (如：「臺灣新北地方法院公告(第二次拍賣)（稿）」→ "臺灣新北地方法院")；找不到為 ""。
+ */
+fun extractCourtName(text: String): String {
+    val compact = text.replace(Regex("""\s+"""), "")
+    val court = Regex("""(?:臺灣|台灣|福建)[^，。、：:「」（）()]{1,4}?地方法院""")
+    return (Regex(court.pattern + "(?=公告)").find(compact) ?: court.find(compact))?.value ?: ""
+}
+
+/**
+ * 開標地點 (如：「開標日、時及場所：115年9月22日上午10時整在本院民事執行處投標室當眾開標」
+ * → "臺灣新北地方法院民事執行處投標室"，「本院」換成公告標題的法院名稱)。
+ * 公告寫「前開處所」或「地址同投標場所」時，補上投標場所的地點或地址。找不到為 ""。
+ */
+fun extractOpeningPlace(text: String): String {
+    val place = extractRawOpeningPlace(text)
+    val court = extractCourtName(text)
+    return if (court.isBlank()) place else place.replace("本院", court)
+}
+
+fun extractRawOpeningPlace(text: String): String {
+    val compact = text.replace(Regex("""\s+"""), "")
+    val opening = Regex("""開標日[、，]?時及場所[:：].*?在(?<place>.+?)當眾開標""").find(compact)
+        ?.groups?.get("place")?.value ?: return ""
+    val biddingPlace = Regex("""投標日[、，]?時及場所[:：].*?投入(?<place>[^。]+)""").find(compact)
+        ?.groups?.get("place")?.value?.replace(Regex("""(?:標匭|標櫃)?內$"""), "") ?: ""
+    if (opening.contains("前開處所") && biddingPlace.isNotBlank()) return biddingPlace
+    val address = Regex("""[（(]地址[:：][^）)]+[）)]""").find(biddingPlace)?.value
+    if (address != null) return opening.replace(Regex("""[（(]地址同投標場所[）)]"""), address)
+    return opening
 }
 
 // 提取總樓層與所在樓層資訊
@@ -751,6 +980,11 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
         Regex("""(?:\d+\s+)?(?:(?<county>[\u4e00-\u9fa5]{2,3}[縣市]))?\s*(?:(?<district>[\u4e00-\u9fa5]{2,4}[區市鎮鄉]))?\s*(?<section>[\u4e00-\u9fa5]{2,8})(?:段)?\s+(?:(?<subSection>[\u4e00-\u9fa50-9]+小段)?\s+)?(?<landNo>\d+(?:-\d+)?)\s+"""),
         Regex("""(?:(?<county>[\u4e00-\u9fa5]{2,3}[縣市]))?\s*(?:(?<district>[\u4e00-\u9fa5]{2,4}[區市鎮鄉]))?\s*(?<section>[\u4e00-\u9fa5]{2,8})(?:段)?\s*(?:(?<subSection>[\u4e00-\u9fa50-9]+小段))?\s*(?<landNo>\d+(?:-\d+)?)\s*(?:地號)""")
     )
+    // 附表土地表格的一列：編號 縣市 鄉鎮市區 段 小段 地號 面積 …，段與小段常不帶「段」「小段」字樣
+    // (例如 "1 臺北市 中山區 正義 四 290 1073.3 1000000分 3,520,000元")，故優先以整列欄位比對。
+    val tableRowRegex = Regex(
+        """^(?:\d+\s+)?(?<county>[\u4e00-\u9fa5]{2}[縣市])\s+(?<district>[\u4e00-\u9fa5]{1,3}[區市鎮鄉])\s+(?<section>[\u4e00-\u9fa5]{2,8})\s+(?:(?<subSection>[\u4e00-\u9fa50-9]{1,6})\s+)?(?<landNo>\d+(?:-\d+)?)\s+\d+(?:\.\d+)?(?:\s|$)"""
+    )
 
     for ((index, line) in lines.withIndex()) {
         val trimmed = line.trim()
@@ -767,14 +1001,24 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
             isInsideLandTable = false
         }
 
-        if (isInsideLandTable) {
-            for (regex in regexes) {
-                val matches = regex.findAll(trimmed)
+        // 點交情形 / 使用情形 / 備註 已不屬於土地表格，其中的「○○地號」是說明文字，不是拍賣標的
+        if (trimmed.contains("點交情形") || trimmed.contains("點交否") || trimmed.contains("使用情形") ||
+            trimmed.matches(Regex("""備\s*註.*"""))) {
+            isInsideLandTable = false
+        }
+
+        // 備考欄 (例如「備考 重測前:詔安段1小段17-6地號」) 是該列的附註，不是另一筆土地
+        if (isInsideLandTable && !trimmed.startsWith("備考")) {
+            val tableRow = tableRowRegex.find(trimmed)
+            val matchGroups = if (tableRow != null) listOf(sequenceOf(tableRow)) else regexes.map { it.findAll(trimmed) }
+            for (matches in matchGroups) {
                 for (match in matches) {
                     val county = match.safeGroupValue("county")
                     val district = match.safeGroupValue("district")
                     var section = match.safeGroupValue("section").removeSuffix("段").trim()
-                    val subSection = match.safeGroupValue("subSection")
+                    val subSection = match.safeGroupValue("subSection").let {
+                        if (it.isBlank() || it.endsWith("小段")) it else it + "小段"
+                    }
                     val landNo = match.safeGroupValue("landNo")
 
                     if (landNo.isNotBlank() && section.length >= 2 && 
@@ -786,7 +1030,7 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
                         val fullSection = section + "段"
 
                         val windowText = (index..minOf(index + 15, lines.size - 1)).joinToString(" ") { lines[it] }
-                        val scope = extractRightScope(windowText)
+                        val scope = extractSplitRightScope(lines, index).ifBlank { extractRightScope(windowText) }
                         val price = extractMinimalPrice(windowText)
 
                         val item = LandLocation(
@@ -810,6 +1054,20 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
     }
 
     return results
+}
+
+/**
+ * 基地坐落欄：依版面位置排序後，該欄在建物列的第一個字串，並折行到後續各行的第一個字串，
+ * 直到「--------------」分隔線 (例如「高雄市三民區金」+「獅段1地號」→「高雄市三民區金獅段1地號」)。
+ */
+fun extractBaseLocation(rowRest: String, followingLines: List<String>): String {
+    val first = rowRest.trim().split(Regex("""\s+""")).first()
+    val divider = followingLines.indexOfFirst { it.trim().startsWith("---") }
+    if (divider == -1 || divider > 4) return first
+    // 續行開頭若是純數字，是旁邊欄位的字 (例如「9 子翠段第三崁小」的 9)，不屬於基地坐落
+    return first + followingLines.take(divider).joinToString("") { line ->
+        line.trim().split(Regex("""\s+""")).firstOrNull { !it.matches(Regex("""\d+""")) } ?: ""
+    }
 }
 
 fun parseBuildings(attachmentText: String): List<BuildingInfo> {
@@ -854,9 +1112,9 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
         
         val firstLine = lines[start].trim()
         val firstMatch = bldgRowRegex.find(firstLine)
-        val rest = firstMatch?.groups["rest"]?.value ?: ""
+        val rest = extractBaseLocation(firstMatch?.groups["rest"]?.value ?: "", blockLines.drop(1))
 
-        val scope = extractRightScope(blockText)
+        val scope = extractSplitRightScope(lines, start).ifBlank { extractRightScope(blockText) }
         val price = extractMinimalPrice(blockText)
         val (floors, located) = extractFloorInfo(blockText)
         val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
