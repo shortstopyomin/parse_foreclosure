@@ -40,6 +40,7 @@ data class Batch(
     val deposit: String,           // 保證金 (例如 "12,828,000元")
     val minimalPriceTotal: String, // 拍賣最低價額合計 (例如 "42,760,000元")
     val handover: String,          // 點交情形 (例如 "不點交")
+    val usage: String,             // 使用情形
     val remarks: String,           // 備註
     val landResults: List<LandLocation>,
     val buildingResults: List<BuildingInfo>,
@@ -87,7 +88,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  *
  * Each batch carries its `deposit` (保證金) and `minimalPriceTotal` (拍賣最低價額合計) in whole
  * 元 (or null), `landBuildingPriceSum` (the sum of its rows' minimal prices, which should equal
- * `minimalPriceTotal`), `owner`, `handover` (點交情形), `remarks` (備註), its own `warnings`, and
+ * `minimalPriceTotal`), `owner`, `handover` (點交情形), `usage` (使用情形), `remarks` (備註), its own `warnings`, and
  * two independent arrays (land parcels, building units) with no field linking one to the other —
  * the in-memory building-to-land cross-join (used only for the human-readable display) is
  * intentionally NOT reflected here. See openspec/changes/replace-land-building-parser-with-kotlin/design.md D9.
@@ -122,6 +123,7 @@ fun batchJson(batch: Batch): String {
     sb.append("\"minimalPriceTotal\":${priceToYuan(batch.minimalPriceTotal) ?: "null"},")
     sb.append("\"landBuildingPriceSum\":${batch.landBuildingPriceSum},")
     sb.append("\"handover\":${jsonString(batch.handover.ifBlank { null })},")
+    sb.append("\"usage\":${jsonString(batch.usage.ifBlank { null })},")
     sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
     sb.append("\"landParcels\":[")
     sb.append(batch.landResults.mapIndexed { index, item ->
@@ -294,6 +296,7 @@ fun parseBatch(section: BatchSection): Batch {
         deposit = deposit,
         minimalPriceTotal = minimalPriceTotal,
         handover = extractHandover(section.text),
+        usage = extractUsage(section.text),
         remarks = extractRemarks(section.text),
         landResults = landResults,
         buildingResults = buildingResults,
@@ -381,7 +384,7 @@ fun main(args: Array<String>) {
 /**
  * The human-readable bilingual result for one PDF, in two levels: the PDF-level fields
  * (case number, bidding date/time, opening place), then one block per 標別 with its
- * deposit, minimal price total, land and building rows, remarks and warnings. Console mode
+ * deposit, minimal price total, land and building rows, usage, remarks and warnings. Console mode
  * prints it right after the file name line; `--json` returns it as `report`.
  */
 fun renderReport(notice: Notice): String {
@@ -459,6 +462,11 @@ fun renderReport(notice: Notice): String {
             }
         }
 
+        if (batch.usage.isNotBlank()) {
+            row()
+            row("🏠 使用情形 Usage:")
+            for (u in batch.usage.lines()) row("  " + u)
+        }
         if (batch.remarks.isNotBlank()) {
             row()
             row("📝 備註 Remarks:")
@@ -768,6 +776,26 @@ fun isOwnerContinuation(line: String): Boolean {
 fun extractHandover(text: String): String =
     Regex("""點\s*交\s*否\s*[:：]?\s*(?<value>[^\n]+)""").find(text)?.groups?.get("value")?.value?.trim() ?: ""
 
+/** 公告結尾的承辦資訊 (函稿、股別、書記官…)，備註與使用情形都在此之前結束。 */
+val NOTICE_FOOTER = Regex("""^(?:函\s*稿|股\s*別|擬\s*判|民\s*事\s*執\s*行\s*處|司\s*法\s*事\s*務\s*官|書\s*記\s*官|法\s*官)""")
+
+/**
+ * 使用情形欄 (如：「使用情形 一、2309建號建物係停車位…」起，到「備註」或公告結尾的承辦資訊之前)；找不到為 ""。
+ * 每一行保留原本的折行。
+ */
+fun extractUsage(text: String): String {
+    val lines = text.lines()
+    val start = lines.indexOfFirst { it.trim().matches(Regex("""使\s*用\s*情\s*形.*""")) }
+    if (start == -1) return ""
+    val end = Regex("""^備\s*註""")
+    return lines.drop(start)
+        .map { it.trim() }
+        .takeWhile { !end.containsMatchIn(it) && !NOTICE_FOOTER.containsMatchIn(it) }
+        .mapIndexed { i, l -> if (i == 0) l.replace(Regex("""^使\s*用\s*情\s*形\s*"""), "") else l }
+        .filter { it.isNotBlank() }
+        .joinToString("\n")
+}
+
 /**
  * 備註欄 (如：「備註 一、上開不動產3宗合併拍賣…」起，到公告結尾的承辦資訊之前)；找不到為 ""。
  * 每一行保留原本的折行。
@@ -776,10 +804,9 @@ fun extractRemarks(text: String): String {
     val lines = text.lines()
     val start = lines.indexOfFirst { it.trim().matches(Regex("""備\s*註.*""")) }
     if (start == -1) return ""
-    val footer = Regex("""^(?:函\s*稿|股\s*別|擬\s*判|民\s*事\s*執\s*行\s*處|司\s*法\s*事\s*務\s*官|書\s*記\s*官|法\s*官)""")
     return lines.drop(start)
         .map { it.trim() }
-        .takeWhile { !footer.containsMatchIn(it) }
+        .takeWhile { !NOTICE_FOOTER.containsMatchIn(it) }
         .mapIndexed { i, l -> if (i == 0) l.replace(Regex("""^備\s*註\s*"""), "") else l }
         .filter { it.isNotBlank() }
         .joinToString("\n")
