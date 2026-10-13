@@ -2,6 +2,8 @@ import org.apache.pdfbox.pdmodel.PDDocument
 import org.apache.pdfbox.text.PDFTextStripper
 import org.apache.pdfbox.text.TextPosition
 import java.io.File
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.util.logging.Level
 import java.util.logging.Logger
 
@@ -29,7 +31,10 @@ data class BuildingInfo(
     val locatedFloor: String = "",
     val buildingType: String = "", // "house", "elevator", "walk-up"
     val buildingTypeRule: String = "", // which rule of determineBuildingType decided buildingType
-    val commonArea: Boolean = false // 共同使用部分 / 公設
+    val commonArea: Boolean = false, // 共同使用部分 / 公設
+    val floorAreaSqm: BigDecimal? = null, // 樓層面積合計 (平方公尺)
+    val balconySqm: BigDecimal = BigDecimal.ZERO, // 附屬建物的陽台 (平方公尺)，未含在樓層面積合計時才另加
+    val areaSqm: BigDecimal? = null // 建物面積 = 樓層面積合計 + 陽台 (平方公尺)；共同使用部分的列為 null
 )
 
 // 定義標別結構：一個標別是投標書上填一張的單位，底下有該標的土地、建物與金額
@@ -50,6 +55,33 @@ data class Batch(
     val landBuildingPriceSum: Long
         get() = landResults.sumOf { priceToYuan(it.landMinimalPrice) ?: 0L } +
             buildingResults.sumOf { priceToYuan(it.buildingMinimalPrice) ?: 0L }
+
+    /** 有建物面積的建物 (共同使用部分不計)。 */
+    private val areaBuildings: List<BuildingInfo>
+        get() = buildingResults.filter { it.areaSqm != null }
+
+    /** 本標別建物面積 (平方公尺)：各建物的建物面積加總；沒有任何建物面積時為 null。 */
+    val buildingAreaSqm: BigDecimal?
+        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.areaSqm) }
+
+    /** 本標別樓層面積合計 (平方公尺)：建物面積中樓層面積的部分；沒有任何建物面積時為 null。 */
+    val floorAreaSqm: BigDecimal?
+        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.floorAreaSqm) }
+
+    /** 本標別陽台面積 (平方公尺)：建物面積中另加的陽台部分；沒有任何建物面積時為 null。 */
+    val balconySqm: BigDecimal?
+        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.balconySqm) }
+
+    /**
+     * 每坪單價 (元/坪)：拍賣最低價額合計 ÷ 建物面積 (坪，取顯示的小數 2 位)，四捨五入到小數 1 位；
+     * 沒有合計或建物面積時為 null。
+     */
+    val pricePerPing: BigDecimal?
+        get() {
+            val total = priceToYuan(minimalPriceTotal) ?: return null
+            val ping = buildingAreaSqm?.let { sqmToPing(it) }?.takeIf { it.signum() > 0 } ?: return null
+            return BigDecimal(total).divide(ping, 1, RoundingMode.HALF_UP)
+        }
 }
 
 // 定義拍賣公告結構：一份 PDF = 一個案號的拍賣公告，底下有一或多個標別
@@ -88,7 +120,10 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  *
  * Each batch carries its `deposit` (保證金) and `minimalPriceTotal` (拍賣最低價額合計) in whole
  * 元 (or null), `landBuildingPriceSum` (the sum of its rows' minimal prices, which should equal
- * `minimalPriceTotal`), `owner`, `handover` (點交情形), `usage` (使用情形), `remarks` (備註), its own `warnings`, and
+ * `minimalPriceTotal`), `owner`, `handover` (點交情形), `usage` (使用情形), `remarks` (備註),
+ * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
+ * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台),
+ * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
  * two independent arrays (land parcels, building units) with no field linking one to the other —
  * the in-memory building-to-land cross-join (used only for the human-readable display) is
  * intentionally NOT reflected here. See openspec/changes/replace-land-building-parser-with-kotlin/design.md D9.
@@ -122,6 +157,13 @@ fun batchJson(batch: Batch): String {
     sb.append("\"deposit\":${priceToYuan(batch.deposit) ?: "null"},")
     sb.append("\"minimalPriceTotal\":${priceToYuan(batch.minimalPriceTotal) ?: "null"},")
     sb.append("\"landBuildingPriceSum\":${batch.landBuildingPriceSum},")
+    sb.append("\"buildingAreaSqm\":${areaJson(batch.buildingAreaSqm)},")
+    sb.append("\"buildingAreaPing\":${areaJson(batch.buildingAreaSqm?.let { sqmToPing(it) })},")
+    sb.append("\"floorAreaSqm\":${areaJson(batch.floorAreaSqm)},")
+    sb.append("\"floorAreaPing\":${areaJson(batch.floorAreaSqm?.let { sqmToPing(it) })},")
+    sb.append("\"balconySqm\":${areaJson(batch.balconySqm)},")
+    sb.append("\"balconyPing\":${areaJson(batch.balconySqm?.let { sqmToPing(it) })},")
+    sb.append("\"pricePerPing\":${batch.pricePerPing?.toPlainString() ?: "null"},")
     sb.append("\"handover\":${jsonString(batch.handover.ifBlank { null })},")
     sb.append("\"usage\":${jsonString(batch.usage.ifBlank { null })},")
     sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
@@ -135,7 +177,10 @@ fun batchJson(batch: Batch): String {
     sb.append(batch.buildingResults.mapIndexed { index, item ->
         "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
             "\"minimalPrice\":${priceToYuan(item.buildingMinimalPrice) ?: "null"},\"sortOrder\":$index," +
-            "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}}"
+            "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}," +
+            "\"floorAreaSqm\":${areaJson(item.floorAreaSqm)},\"floorAreaPing\":${areaJson(item.floorAreaSqm?.let { sqmToPing(it) })}," +
+            "\"balconySqm\":${areaJson(item.balconySqm)},\"balconyPing\":${areaJson(sqmToPing(item.balconySqm))}," +
+            "\"areaSqm\":${areaJson(item.areaSqm)},\"areaPing\":${areaJson(item.areaSqm?.let { sqmToPing(it) })}}"
     }.joinToString(","))
     sb.append("],")
     val main = mainBuilding(batch.buildingResults)
@@ -147,6 +192,19 @@ fun batchJson(batch: Batch): String {
 
 /** A 最低拍賣價格 like "11,500,000元" as whole 元 (11500000), or null when there is none. */
 fun priceToYuan(price: String): Long? = price.replace(Regex("""[,\s元]"""), "").toLongOrNull()
+
+/** 1 平方公尺 = 0.3025 坪 (台灣坪)。 */
+val PING_PER_SQM = BigDecimal("0.3025")
+
+/** 平方公尺換算成坪，四捨五入到小數 2 位。 */
+fun sqmToPing(sqm: BigDecimal): BigDecimal = sqm.multiply(PING_PER_SQM).setScale(2, RoundingMode.HALF_UP)
+
+/** An area as a JSON number with 2 decimals, or null. */
+fun areaJson(area: BigDecimal?): String = area?.setScale(2, RoundingMode.HALF_UP)?.toPlainString() ?: "null"
+
+/** An area for the report, 坪 first, like "30.90 坪 (102.16 平方公尺)". */
+fun formatArea(sqm: BigDecimal): String =
+    "${sqmToPing(sqm).toPlainString()} 坪 (${sqm.setScale(2, RoundingMode.HALF_UP).toPlainString()} 平方公尺)"
 
 /** Whole 元 formatted like the PDF (42760000 -> "42,760,000元"). */
 fun formatYuan(amount: Long): String = "%,d元".format(amount)
@@ -196,6 +254,9 @@ fun computeBatchWarnings(
                     "(Land + building prices sum to ${formatYuan(sum)}, but the minimal price total is ${formatYuan(total)})"
             )
         }
+    }
+    for (b in buildingResults.filter { it.floorAreaSqm == null }) {
+        warnings.add("${b.buildingNumber}建號未解析到樓層面積合計 (No floor area total found for building ${b.buildingNumber})")
     }
     val main = mainBuilding(buildingResults)
     if (buildingResults.isNotEmpty() && main == null) {
@@ -421,6 +482,12 @@ fun renderReport(notice: Notice): String {
         }
         row("💰 拍賣最低價額合計 Minimal Price Total: " + batch.minimalPriceTotal.ifBlank { "(未解析到 Not found)" } + check)
         if (batch.handover.isNotBlank()) row("📋 點交情形 Handover: " + batch.handover)
+        batch.buildingAreaSqm?.let {
+            row("📐 建物面積 Building Area: " + formatArea(it))
+            row("   樓層面積合計 Floor Area: " + formatArea(batch.floorAreaSqm!!))
+            row("   陽台 Balcony: " + formatArea(batch.balconySqm!!))
+        }
+        batch.pricePerPing?.let { row("🏷️ 每坪單價 Price per Ping: " + "%,.1f".format(it) + " 元/坪") }
 
         // 該標別的土地
         row()
@@ -457,6 +524,11 @@ fun renderReport(notice: Notice): String {
                 if (item.baseLocation.isNotBlank()) row("  📍 基地坐落 Base Location:     " + item.baseLocation)
                 if (item.totalFloors != null) row("  🏢 房屋層數 Total Floors:      " + item.totalFloors + " 層 (" + item.totalFloors + " Stories)")
                 if (item.locatedFloor.isNotBlank()) row("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
+                if (item.areaSqm != null) {
+                    row("  📐 建物面積 Building Area:     " + formatArea(item.areaSqm))
+                    row("     樓層面積合計 Floor Area:    " + formatArea(item.floorAreaSqm!!))
+                    row("     陽台 Balcony:              " + formatArea(item.balconySqm))
+                }
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
                 if (item.buildingMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
             }
@@ -1084,6 +1156,29 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
 }
 
 /**
+ * 建物列 (備考之前) 的樓層面積合計，以及要另加的附屬建物陽台面積 (平方公尺)。
+ * 例如「七層: 87.13 陽臺:15.03 … 合計: 87.13」→ (87.13, 15.03)。
+ * 陽台若列在樓層面積欄且已含在合計內 (如「5層: 102.26 陽台: 25.37 合計: 127.63」)，就不再另加 → (127.63, 0)。
+ * 找不到合計時樓層面積為 null。
+ */
+fun extractBuildingArea(rowText: String): Pair<BigDecimal?, BigDecimal> {
+    val number = """\d+(?:\.\d+)?"""
+    val total = Regex("""合\s*計\s*[:：]\s*(?<v>$number)""").find(rowText)
+        ?.groups?.get("v")?.value?.toBigDecimal() ?: return Pair(null, BigDecimal.ZERO)
+    val balconies = Regex("""陽\s*[台臺]\s*[:：(（]?\s*(?<v>$number)""").findAll(rowText)
+        .map { it.groups["v"]!!.value.toBigDecimal() }.toList()
+    val balcony = balconies.fold(BigDecimal.ZERO, BigDecimal::add)
+    // 樓層面積欄 (「標示: 數字」) 除合計以外的加總剛好等於合計，代表其中的陽台已算進合計
+    val entries = Regex("""(?<label>[^\s:：]+)\s*[:：]\s*(?<v>$number)""").findAll(rowText)
+        .filter { !Regex("""合\s*計""").containsMatchIn(it.groups["label"]!!.value) }
+        .toList()
+    val balconyListed = entries.any { Regex("""陽\s*[台臺]""").containsMatchIn(it.groups["label"]!!.value) }
+    val entrySum = entries.fold(BigDecimal.ZERO) { acc, m -> acc.add(m.groups["v"]!!.value.toBigDecimal()) }
+    val included = balconyListed && entrySum.compareTo(total) == 0
+    return Pair(total, if (included) BigDecimal.ZERO else balcony)
+}
+
+/**
  * 基地坐落欄：依版面位置排序後，該欄在建物列的第一個字串，並折行到後續各行的第一個字串，
  * 直到「--------------」分隔線 (例如「高雄市三民區金」+「獅段1地號」→「高雄市三民區金獅段1地號」)。
  */
@@ -1146,6 +1241,10 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
         val (floors, located) = extractFloorInfo(blockText)
         val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
         val isCommonArea = blockText.contains("共同使用部分") || blockText.contains("公設")
+        // 備考常寫「含共同使用部分1772建號」，只看備考之前的建物列本身：共同使用部分的合計是整棟公設面積，不算建物面積
+        val rowText = blockLines.takeWhile { !it.trim().startsWith("備考") }.joinToString("\n")
+        val isCommonAreaRow = rowText.contains("共同使用部分") || rowText.contains("公設")
+        val (floorArea, balcony) = extractBuildingArea(rowText)
         if (firstMainType == null && !isCommonArea) {
             firstMainType = bType
         }
@@ -1160,7 +1259,10 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             locatedFloor = located,
             buildingType = bType,
             buildingTypeRule = bTypeRule,
-            commonArea = isCommonArea
+            commonArea = isCommonArea,
+            floorAreaSqm = floorArea,
+            balconySqm = balcony,
+            areaSqm = if (isCommonAreaRow) null else floorArea?.add(balcony)
         )
         if (results.none { it.buildingNumber == item.buildingNumber }) {
             results.add(item)
