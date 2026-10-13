@@ -46,6 +46,8 @@ data class Batch(
     val minimalPriceTotal: String, // 拍賣最低價額合計 (例如 "42,760,000元")
     val handover: String,          // 點交情形 (例如 "不點交")
     val usage: String,             // 使用情形
+    val unnaturalDeath: Boolean,   // 是否曾發生非自然死亡 (凶宅)
+    val unnaturalDeathEvidence: String, // 判定為凶宅所依據的句子；不是凶宅時為 ""
     val remarks: String,           // 備註
     val landResults: List<LandLocation>,
     val buildingResults: List<BuildingInfo>,
@@ -121,6 +123,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * Each batch carries its `deposit` (保證金) and `minimalPriceTotal` (拍賣最低價額合計) in whole
  * 元 (or null), `landBuildingPriceSum` (the sum of its rows' minimal prices, which should equal
  * `minimalPriceTotal`), `owner`, `handover` (點交情形), `usage` (使用情形), `remarks` (備註),
+ * `unnaturalDeath` (是否曾發生非自然死亡，即凶宅) with the sentence it was decided from as `unnaturalDeathEvidence` (or null),
  * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
  * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台),
  * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
@@ -166,6 +169,8 @@ fun batchJson(batch: Batch): String {
     sb.append("\"pricePerPing\":${batch.pricePerPing?.toPlainString() ?: "null"},")
     sb.append("\"handover\":${jsonString(batch.handover.ifBlank { null })},")
     sb.append("\"usage\":${jsonString(batch.usage.ifBlank { null })},")
+    sb.append("\"unnaturalDeath\":${batch.unnaturalDeath},")
+    sb.append("\"unnaturalDeathEvidence\":${jsonString(batch.unnaturalDeathEvidence.ifBlank { null })},")
     sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
     sb.append("\"landParcels\":[")
     sb.append(batch.landResults.mapIndexed { index, item ->
@@ -350,6 +355,7 @@ fun parseBatch(section: BatchSection): Batch {
     val (caseNumber, owner) = extractCaseNumberAndOwner(section.text)
     val deposit = extractDeposit(section.text)
     val minimalPriceTotal = extractMinimalPriceTotal(section.text)
+    val unnaturalDeathEvidence = findUnnaturalDeath(section.text)
     return Batch(
         batchNumber = section.batchNumber,
         caseNumber = caseNumber,
@@ -358,6 +364,8 @@ fun parseBatch(section: BatchSection): Batch {
         minimalPriceTotal = minimalPriceTotal,
         handover = extractHandover(section.text),
         usage = extractUsage(section.text),
+        unnaturalDeath = unnaturalDeathEvidence.isNotBlank(),
+        unnaturalDeathEvidence = unnaturalDeathEvidence,
         remarks = extractRemarks(section.text),
         landResults = landResults,
         buildingResults = buildingResults,
@@ -482,6 +490,12 @@ fun renderReport(notice: Notice): String {
         }
         row("💰 拍賣最低價額合計 Minimal Price Total: " + batch.minimalPriceTotal.ifBlank { "(未解析到 Not found)" } + check)
         if (batch.handover.isNotBlank()) row("📋 點交情形 Handover: " + batch.handover)
+        if (batch.unnaturalDeath) {
+            row("☠️ 非自然死亡 (凶宅) Unnatural Death: 是 Yes")
+            row("   " + batch.unnaturalDeathEvidence)
+        } else {
+            row("☠️ 非自然死亡 (凶宅) Unnatural Death: 否 No")
+        }
         batch.buildingAreaSqm?.let {
             row("📐 建物面積 Building Area: " + formatArea(it))
             row("   樓層面積合計 Floor Area: " + formatArea(batch.floorAreaSqm!!))
@@ -847,6 +861,37 @@ fun isOwnerContinuation(line: String): Boolean {
 /** 點交情形 (如：「點交情形 點交否: 不點交」→ "不點交")；找不到為 ""。 */
 fun extractHandover(text: String): String =
     Regex("""點\s*交\s*否\s*[:：]?\s*(?<value>[^\n]+)""").find(text)?.groups?.get("value")?.value?.trim() ?: ""
+
+/** 明確寫出曾發生非自然死亡的說法 (如「曾於112年12月10日發生非自然死亡事件」「即俗稱之「凶宅」」「自殺於內」)。 */
+val UNNATURAL_DEATH_POSITIVE = Regex(
+    """曾[^，。；]{0,20}?發生[^，。；]{0,10}?(?:非自然死亡|死亡|自殺|他殺|命案)""" +
+        """|(?:俗稱|即|屬|係|為)之?[「『"]?[凶兇]宅(?!網)""" +
+        """|自殺|他殺|命案|燒炭|上吊|陳屍|身亡|輕生"""
+)
+
+/** 否定或詢問的說法 (如「並無發生非自然死亡情形」「未發現有非自然死亡情事」「查詢有無…」「是否為…」)。 */
+val UNNATURAL_DEATH_NEGATION = Regex("""無|未|沒有|不曾|是否""")
+
+/**
+ * 本標別是否曾發生非自然死亡 (凶宅)：回傳判定依據的句子，不是凶宅時為 ""。
+ * 公告多半只是例行說明 (「並無發生非自然死亡情形」「如…建物內有非自然死亡事件等…於使用情形欄載明」)，
+ * 所以只認明確的說法，且該子句 (以「，。；」切開) 在說法之前不能有否定或詢問的字，也不能是「如…等」的舉例。
+ */
+fun findUnnaturalDeath(text: String): String {
+    val joined = text.lines().joinToString("") { it.trim() }
+    for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
+        for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
+            val m = UNNATURAL_DEATH_POSITIVE.find(clause) ?: continue
+            val before = clause.substring(0, m.range.first)
+            val after = clause.substring(m.range.last + 1)
+            if (UNNATURAL_DEATH_NEGATION.containsMatchIn(before)) continue
+            // 舉例的清單 (「如海砂屋、…、自殺等」) 不是說本件發生過
+            if (before.contains("如") && after.contains("等")) continue
+            return sentence.trim()
+        }
+    }
+    return ""
+}
 
 /** 公告結尾的承辦資訊 (函稿、股別、書記官…)，備註與使用情形都在此之前結束。 */
 val NOTICE_FOOTER = Regex("""^(?:函\s*稿|股\s*別|擬\s*判|民\s*事\s*執\s*行\s*處|司\s*法\s*事\s*務\s*官|書\s*記\s*官|法\s*官)""")
