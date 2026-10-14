@@ -52,6 +52,8 @@ data class Batch(
     val usage: String,             // 使用情形
     val unnaturalDeath: Boolean,   // 是否曾發生非自然死亡 (凶宅)
     val unnaturalDeathEvidence: String, // 判定為凶宅所依據的句子；不是凶宅時為 ""
+    val partitionSale: Boolean,    // 是否為變價分割共有物
+    val partitionSaleEvidence: String, // 判定為變價分割共有物所依據的句子；不是時為 ""
     val remarks: String,           // 備註
     val landResults: List<LandLocation>,
     val buildingResults: List<BuildingInfo>,
@@ -132,6 +134,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * these four handover fields are always strings, "" when there is nothing to report, never null —
  * the sentences they were decided from as `handoverEvidence`, `usage` (使用情形), `remarks` (備註),
  * `unnaturalDeath` (是否曾發生非自然死亡，即凶宅) with the sentence it was decided from as `unnaturalDeathEvidence` (or null),
+ * `partitionSale` (是否為變價分割共有物) with the sentence it was decided from as `partitionSaleEvidence` ("" when not),
  * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
  * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台),
  * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
@@ -183,6 +186,8 @@ fun batchJson(batch: Batch): String {
     sb.append("\"usage\":${jsonString(batch.usage.ifBlank { null })},")
     sb.append("\"unnaturalDeath\":${batch.unnaturalDeath},")
     sb.append("\"unnaturalDeathEvidence\":${jsonString(batch.unnaturalDeathEvidence.ifBlank { null })},")
+    sb.append("\"partitionSale\":${batch.partitionSale},")
+    sb.append("\"partitionSaleEvidence\":${jsonString(batch.partitionSaleEvidence)},")
     sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
     sb.append("\"landParcels\":[")
     sb.append(batch.landResults.mapIndexed { index, item ->
@@ -372,6 +377,7 @@ fun parseBatch(section: BatchSection): Batch {
     val remarks = extractRemarks(section.text)
     val handoverField = extractHandover(section.text)
     val handover = determineHandover(handoverField, usage + "\n" + remarks)
+    val partitionSaleEvidence = findPartitionSale(usage + "\n" + remarks)
     return Batch(
         batchNumber = section.batchNumber,
         caseNumber = caseNumber,
@@ -386,6 +392,8 @@ fun parseBatch(section: BatchSection): Batch {
         usage = usage,
         unnaturalDeath = unnaturalDeathEvidence.isNotBlank(),
         unnaturalDeathEvidence = unnaturalDeathEvidence,
+        partitionSale = partitionSaleEvidence.isNotBlank(),
+        partitionSaleEvidence = partitionSaleEvidence,
         remarks = remarks,
         landResults = landResults,
         buildingResults = buildingResults,
@@ -527,6 +535,10 @@ fun renderReport(notice: Notice): String {
             row("   " + batch.unnaturalDeathEvidence)
         } else {
             row("☠️ 非自然死亡 (凶宅) Unnatural Death: 否 No")
+        }
+        if (batch.partitionSale) {
+            row("⚖️ 變價分割共有物 Partition Sale: 是 Yes")
+            row("   " + batch.partitionSaleEvidence)
         }
         batch.buildingAreaSqm?.let {
             row("📐 建物面積 Building Area: " + formatArea(it))
@@ -1068,6 +1080,25 @@ fun scanUnnaturalDeath(text: String): Pair<String, String> {
         }
     }
     return "" to rebutted
+}
+
+/** 變價分割共有物的說法 (「本件係變價分割共有物」「裁判分割共有物事件」)。 */
+val PARTITION_SALE = Regex("""變價分割|分割共有物""")
+
+/**
+ * 本標別是否為變價分割共有物 (如「本件係變價分割共有物，依民法第830條第2項準用第824條第7項規定，共有人有優先承買權…」)：
+ * 回傳判定依據的句子，不是時為 ""。子句中說法之前有「如、若、是否」的是假設或詢問，不算。
+ */
+fun findPartitionSale(text: String): String {
+    val joined = text.lines().joinToString("") { it.trim() }
+    for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
+        for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
+            val m = PARTITION_SALE.find(clause) ?: continue
+            if (Regex("""如|若|是否""").containsMatchIn(clause.substring(0, m.range.first))) continue
+            return sentence.trim()
+        }
+    }
+    return ""
 }
 
 /** 公告結尾的承辦資訊 (函稿、股別、書記官…)，備註與使用情形都在此之前結束。 */
