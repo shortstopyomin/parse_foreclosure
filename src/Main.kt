@@ -44,7 +44,7 @@ data class Batch(
     val owner: String,             // 財產所有人 (同一案號的不同標別可能不同人)
     val deposit: String,           // 保證金 (例如 "12,828,000元")
     val minimalPriceTotal: String, // 拍賣最低價額合計 (例如 "42,760,000元")
-    val handover: String,          // 點交情形的判定 (例如 "不點交")；點交情形欄只寫「如備註或使用情形欄所示」時由內文推論
+    val handover: String,          // 點交情形的判定："點交" / "不點交" / "部分點交"；點交情形欄只寫「如備註或使用情形欄所示」時由內文推論
     val handoverField: String,     // 點交情形欄原文 (例如 "如備註或使用情形欄所示")
     val parkingHandover: String,   // 內文有提到停車位點交與否時為 "點交" / "不點交"，否則 ""
     val commonAreaHandover: String, // 內文有提到共有部分點交與否時為 "點交" / "不點交"，否則 ""
@@ -126,7 +126,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  *
  * Each batch carries its `deposit` (保證金) and `minimalPriceTotal` (拍賣最低價額合計) in whole
  * 元 (or null), `landBuildingPriceSum` (the sum of its rows' minimal prices, which should equal
- * `minimalPriceTotal`), `owner`, `handover` (點交判定: 點交 / 不點交 / 部分點交、部分不點交, inferred from
+ * `minimalPriceTotal`), `owner`, `handover` (點交判定: 點交 / 不點交 / 部分點交, inferred from
  * 使用情形 and 備註 when the 點交否 field only says 如備註或使用情形欄所示) with the raw field as `handoverField`,
  * `parkingHandover` / `commonAreaHandover` (停車位 / 共有部分 點交 or 不點交, or "" when the text doesn't say) —
  * these four handover fields are always strings, "" when there is nothing to report, never null —
@@ -367,7 +367,7 @@ fun parseBatch(section: BatchSection): Batch {
     val (caseNumber, owner) = extractCaseNumberAndOwner(section.text)
     val deposit = extractDeposit(section.text)
     val minimalPriceTotal = extractMinimalPriceTotal(section.text)
-    val unnaturalDeathEvidence = findUnnaturalDeath(section.text)
+    val (unnaturalDeathEvidence, rebuttedUnnaturalDeath) = scanUnnaturalDeath(section.text)
     val usage = extractUsage(section.text)
     val remarks = extractRemarks(section.text)
     val handoverField = extractHandover(section.text)
@@ -389,7 +389,11 @@ fun parseBatch(section: BatchSection): Batch {
         remarks = remarks,
         landResults = landResults,
         buildingResults = buildingResults,
-        warnings = computeBatchWarnings(landResults, buildingResults, deposit, minimalPriceTotal, owner) + handover.warnings
+        warnings = computeBatchWarnings(landResults, buildingResults, deposit, minimalPriceTotal, owner) + handover.warnings +
+            listOfNotNull(rebuttedUnnaturalDeath.ifBlank { null }?.let {
+                "有人稱曾發生非自然死亡，但經查證死亡地點不在本件標的，判定為非凶宅 " +
+                    "(A death was claimed, but the place of death was verified to be elsewhere; not flagged): $it"
+            })
     )
 }
 
@@ -509,11 +513,11 @@ fun renderReport(notice: Notice): String {
             else -> " ❌ (土地+建物 Land+Building = ${formatYuan(sum)})"
         }
         row("💰 拍賣最低價額合計 Minimal Price Total: " + batch.minimalPriceTotal.ifBlank { "(未解析到 Not found)" } + check)
-        if (batch.handover.isNotBlank()) {
-            val source = if (batch.handover != batch.handoverField && batch.handoverField.isNotBlank()) {
+        if (batch.handover.isNotBlank() || batch.handoverField.isNotBlank()) {
+            val source = if (batch.handoverField.isNotBlank() && !HANDOVER_DEFINITE.matches(batch.handoverField)) {
                 " (依內文 From text；點交情形欄 Field: ${batch.handoverField})"
             } else ""
-            row("📋 點交情形 Handover: " + batch.handover + source)
+            row("📋 點交情形 Handover: " + batch.handover.ifBlank { "無法判定 Undetermined" } + source)
         }
         if (batch.parkingHandover.isNotBlank()) row("🚗 停車位點交 Parking Handover: " + batch.parkingHandover)
         if (batch.commonAreaHandover.isNotBlank()) row("🏛️ 共有部分點交 Common Area Handover: " + batch.commonAreaHandover)
@@ -890,33 +894,41 @@ fun isOwnerContinuation(line: String): Boolean {
 fun extractHandover(text: String): String =
     Regex("""點\s*交\s*否\s*[:：]?\s*(?<value>[^\n]+)""").find(text)?.groups?.get("value")?.value?.trim() ?: ""
 
-/** 點交情形欄本身就有答案 (「點交」「不點交」「部分點交、部分不點交」)，不是「如備註或使用情形欄所示」之類的指引。 */
-val HANDOVER_DEFINITE = Regex("""^(?:不點交|點交|部分點交、?部分不點交)$""")
+/** 點交情形欄本身就有答案 (「點交」「不點交」「部分點交」「部分點交、部分不點交」)，不是「如備註或使用情形欄所示」之類的指引。 */
+val HANDOVER_DEFINITE = Regex("""^(?:不點交|點交|部分點交(?:、?部分不點交)?)$""")
+
+/** 欄位的答案統一成 "點交" / "不點交" / "部分點交"。 */
+fun normalizeHandover(field: String): String = if (field.startsWith("部分")) "部分點交" else field
 
 /** 內文中的點交說法 (「拍定後點交」「依現況點交」「均不點交」「無法點交」)；`neg` 有值即為不點交。 */
 val HANDOVER_STATEMENT = Regex("""(?<neg>不予?|無法|不能|未能)?點交""")
 
 /** 點交說法之前若有這些字，是詢問或條件而非判定 (「是否點交」「有無點交」)。 */
-val HANDOVER_QUESTION = Regex("""是否|有無""")
+val HANDOVER_QUESTION = Regex("""是否|有無|如有|若有""")
+
+/** 「拍定後僅建物點交」：只有一部分點交。 */
+val HANDOVER_ONLY = Regex("""僅""")
 
 val PARKING_SUBJECT = Regex("""停車位|車位""")
 val COMMON_AREA_SUBJECT = Regex("""共有部分|共用部分|共同使用部分|公共設施|公設""")
 
+/** 子句換了主題：講的是整個標的、建物或土地，不再是前面提到的共有部分。 */
+val GENERAL_SUBJECT = Regex("""本件|建物|房屋|土地|標的""")
+
 /** 本標別的點交判定：整體 (`handover`)、停車位、共有部分各自的結論，及所依據的內文句子。 */
 data class HandoverResult(
-    val handover: String,        // "點交" / "不點交" / "部分點交、部分不點交"；無從判定時為點交情形欄原文
+    val handover: String,        // "點交" / "不點交" / "部分點交"；無從判定時為 ""
     val parking: String,         // 內文有提到停車位點交與否時為 "點交" / "不點交"，否則 ""
     val commonArea: String,      // 內文有提到共有部分點交與否時為 "點交" / "不點交"，否則 ""
     val evidence: List<String>,  // 內文中講到點交的句子
     val warnings: List<String>
 )
 
-/** 同一主題的多個判定合成一個結論。 */
-fun combineHandover(verdicts: List<Boolean>): String? = when {
+/** 同一主題的多個判定 ("點交" / "不點交" / "部分點交") 合成一個結論：都一樣就是它，否則為部分點交。 */
+fun combineHandover(verdicts: List<String>): String? = when {
     verdicts.isEmpty() -> null
-    verdicts.all { it } -> "點交"
-    verdicts.none { it } -> "不點交"
-    else -> "部分點交、部分不點交"
+    verdicts.distinct().size == 1 -> verdicts.first()
+    else -> "部分點交"
 }
 
 /**
@@ -926,28 +938,52 @@ fun combineHandover(verdicts: List<Boolean>): String? = when {
  * 子句提到停車位就是停車位的、提到共有部分 (共同使用部分、公設) 就是共有部分的，其他是整體的。
  * 例如「拍定後依現況點交，共有部分及停車位則均不點交」→ 整體點交、停車位與共有部分不點交。
  * 整句在講停車位 (「本件僅拍賣上開停車位之應有部分，…，本件拍定後不點交」) 時，整體的說法也算停車位的。
+ * 停車位、共有部分的主題會延續到同句之後的子句，直到某個子句換講別的 (本件、建物、土地，或另一個主題)：
+ * 「建物公設持分部分，如謄本上未能明確載明由債務人分管使用，均不點交」→ 共有部分不點交；
+ * 「又停車位係建物之共有部分，故不點交」→ 停車位與共有部分都不點交。
  *
  * 點交情形欄本身有答案時以欄位為準 (內文的整體說法與它不同時加警示)；
  * 欄位只是「如備註或使用情形欄所示」之類時，以內文的整體說法為準。
+ * 詢問或假設 (「是否點交」「如有其他依法不能點交之情事」) 與裁量 (「本院得不點交」) 不算判定；
+ * 「僅建物點交」或同一主題有點交也有不點交時為部分點交，例如
+ * 「拍定後僅建物點交，但如有其他依法不能點交之情事，本院得不點交，其餘部分不點交」→ 部分點交。
  */
 fun determineHandover(field: String, bodyText: String): HandoverResult {
-    val general = mutableListOf<Boolean>()
-    val parking = mutableListOf<Boolean>()
-    val common = mutableListOf<Boolean>()
+    val general = mutableListOf<String>()
+    val parking = mutableListOf<String>()
+    val common = mutableListOf<String>()
     val evidence = mutableListOf<String>()
 
     val joined = bodyText.lines().joinToString("") { it.trim() }
     for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
         var found = false
         var sentenceParking = false
-        val sentenceGeneral = mutableListOf<Boolean>()
+        // 前面的子句提到停車位 / 共有部分，且之後還沒換主題
+        var parkingTopic = false
+        var commonTopic = false
+        val sentenceGeneral = mutableListOf<String>()
         for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
+            val namesParking = PARKING_SUBJECT.containsMatchIn(clause)
+            val namesCommon = COMMON_AREA_SUBJECT.containsMatchIn(clause)
+            if (namesParking || namesCommon) {
+                parkingTopic = namesParking
+                commonTopic = namesCommon
+            } else if (GENERAL_SUBJECT.containsMatchIn(clause)) {
+                parkingTopic = false
+                commonTopic = false
+            }
             for (m in HANDOVER_STATEMENT.findAll(clause)) {
-                if (HANDOVER_QUESTION.containsMatchIn(clause.substring(0, m.range.first))) continue
-                val handedOver = m.groups["neg"] == null
+                val before = clause.substring(0, m.range.first)
+                // 詢問、假設 (「如有其他依法不能點交之情事」) 或裁量 (「本院得不點交」) 都不是判定
+                if (HANDOVER_QUESTION.containsMatchIn(before) || before.endsWith("得")) continue
+                val handedOver = when {
+                    m.groups["neg"] != null -> "不點交"
+                    HANDOVER_ONLY.containsMatchIn(before) -> "部分點交"
+                    else -> "點交"
+                }
                 found = true
-                val isParking = PARKING_SUBJECT.containsMatchIn(clause)
-                val isCommon = COMMON_AREA_SUBJECT.containsMatchIn(clause)
+                val isParking = parkingTopic
+                val isCommon = commonTopic
                 if (isParking) {
                     parking.add(handedOver)
                     sentenceParking = true
@@ -970,15 +1006,16 @@ fun determineHandover(field: String, bodyText: String): HandoverResult {
     val warnings = mutableListOf<String>()
     val handover = when {
         HANDOVER_DEFINITE.matches(field) -> {
-            if (fromText != null && fromText != field) {
+            val fromField = normalizeHandover(field)
+            if (fromText != null && fromText != fromField) {
                 warnings.add("點交情形欄為「$field」，但內文為「$fromText」 (Handover field says $field, but the text says $fromText)")
             }
-            field
+            fromField
         }
         fromText != null -> fromText
         else -> {
             warnings.add("無法判定是否點交 (Could not determine the handover status)")
-            field
+            ""
         }
     }
     return HandoverResult(handover, combineHandover(parking) ?: "", combineHandover(common) ?: "", evidence, warnings)
@@ -994,25 +1031,43 @@ val UNNATURAL_DEATH_POSITIVE = Regex(
 /** 否定或詢問的說法 (如「並無發生非自然死亡情形」「未發現有非自然死亡情事」「查詢有無…」「是否為…」)。 */
 val UNNATURAL_DEATH_NEGATION = Regex("""無|未|沒有|不曾|是否""")
 
+/** 查證死亡地點不在本件標的 (「死亡地點係…療養院非本件拍賣標的」「並非於本件建物內死亡」)。 */
+val UNNATURAL_DEATH_REBUTTAL = Regex(
+    """死亡地點[^。；]{0,30}?(?:非|並非|不是|不在)""" +
+        """|(?:非|並非|不是)(?:在|於)?(?:本件|本|該)?(?:拍賣)?(?:建物|房屋|標的物?)(?:內|中)?(?:死亡|身亡|過世|發生)"""
+)
+
 /**
- * 本標別是否曾發生非自然死亡 (凶宅)：回傳判定依據的句子，不是凶宅時為 ""。
+ * 本標別是否曾發生非自然死亡 (凶宅)：回傳 (判定依據的句子, 被查證推翻的句子)，沒有時各為 ""。
  * 公告多半只是例行說明 (「並無發生非自然死亡情形」「如…建物內有非自然死亡事件等…於使用情形欄載明」)，
  * 所以只認明確的說法，且該子句 (以「，。；」切開) 在說法之前不能有否定或詢問的字，也不能是「如…等」的舉例。
+ * 說法之後同一句若查證死亡地點不在本件標的
+ * (「另有其妹在屋內自殺身亡情事，惟經本院向戶政機關函查，死亡登記申請書上記載死亡地點係臺北市臺灣療養院非本件拍賣標的」)，
+ * 就不算凶宅，改回傳為被推翻的句子以便提醒。
  */
-fun findUnnaturalDeath(text: String): String {
+fun scanUnnaturalDeath(text: String): Pair<String, String> {
     val joined = text.lines().joinToString("") { it.trim() }
+    var rebutted = ""
     for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
+        var offset = 0
         for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
+            val clauseStart = offset
+            offset += clause.length
             val m = UNNATURAL_DEATH_POSITIVE.find(clause) ?: continue
             val before = clause.substring(0, m.range.first)
             val after = clause.substring(m.range.last + 1)
             if (UNNATURAL_DEATH_NEGATION.containsMatchIn(before)) continue
             // 舉例的清單 (「如海砂屋、…、自殺等」) 不是說本件發生過
             if (before.contains("如") && after.contains("等")) continue
-            return sentence.trim()
+            // 同一句接著查證死亡地點不在本件標的
+            if (UNNATURAL_DEATH_REBUTTAL.containsMatchIn(sentence.substring(clauseStart + m.range.last + 1))) {
+                if (rebutted.isEmpty()) rebutted = sentence.trim()
+                break
+            }
+            return sentence.trim() to ""
         }
     }
-    return ""
+    return "" to rebutted
 }
 
 /** 公告結尾的承辦資訊 (函稿、股別、書記官…)，備註與使用情形都在此之前結束。 */
