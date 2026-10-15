@@ -356,7 +356,7 @@ fun parseNotice(document: PDDocument): Notice {
     val biddingDateTime = extractBiddingDateTime(fullText)
     val openingPlace = extractOpeningPlace(sortedText)
 
-    val subject = extractSubject(fullText)
+    val subject = extractSubject(fullText) + "\n" + extractBasis(fullText)
     val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject) }
     val caseNumber = batches.map { it.caseNumber }.firstOrNull { it.isNotBlank() } ?: ""
     val owners = batches.map { it.owner }.filter { it.isNotBlank() }.distinct()
@@ -370,7 +370,7 @@ fun parseNotice(document: PDDocument): Notice {
     )
 }
 
-/** 解析一個標別段落；土地與建物只在同一標別內對應。`subject` 是公告的主旨，用來判定分割變價拍賣。 */
+/** 解析一個標別段落；土地與建物只在同一標別內對應。`subject` 是公告的主旨與依據，用來判定分割變價拍賣。 */
 fun parseBatch(section: BatchSection, subject: String = ""): Batch {
     val landResults = parseLandLocations(section.text)
     val buildingResults = parseBuildings(section.text)
@@ -1097,15 +1097,26 @@ fun scanUnnaturalDeath(text: String): Pair<String, String> {
 }
 
 /**
- * 分割變價拍賣的說法：使用情形的「本件係變價分割共有物」，或主旨的「分割遺產（變價）強制執行事件」「分割共有物事件」。
+ * 分割變價拍賣的說法：
+ * - 使用情形或備註的「本件係變價分割共有物」「依民法第824條第7項規定，除買受人為共有人外，共有人有優先承買權」
+ *   「依民法第830條第2項準用第824條第7項規定」(第824條是共有物分割，第830條是公同共有物如遺產的分割)；
+ * - 主旨的「分割遺產（變價）強制執行事件」「分割共有物（變價）強制執行事件」；
+ * - 依據的「強制執行法第131條第2項準用第81條」(第131條是分割共有物或遺產的判決的執行，一般拍賣只依第81條)。
+ * 比對前已去除空白並把全形數字改為半形 (見 [findStatement])。
  */
-val PARTITION_SALE = Regex("""變價分割|分割共有物|分割遺產|遺產分割""")
+val PARTITION_SALE = Regex(
+    """變價分割|分割共有物|共有物分割|分割遺產|遺產分割|[（(]變價[）)]|民法第824條|民法第830條|準用第824條|強制執行法第131條"""
+)
 
 /**
  * 持分拍賣的說法：「本件係拍賣建物所有權之應有部分」「本件僅拍賣不動產應有部分」「609-12地號土地僅拍賣債務人應有部分」。
  * 「現場查封部分債務人應有部分時」沒有「拍賣」，不算。
  */
 val SHARE_SALE = Regex("""拍賣[^。；;，,]{0,15}(?:應有部分|持分)""")
+
+/** 公告的依據 (「依據：強制執行法第131條第2項準用第81條。」)；找不到時為 ""。 */
+fun extractBasis(fullText: String): String =
+    Regex("""依\s*據\s*[:：]([^\n]*)""").find(fullText)?.groupValues?.get(1)?.trim() ?: ""
 
 /** 公告的主旨 (「主旨：公告以投標方法拍賣本院114年度司執字第164545號分割遺產（變價）強制執行事件，…」)，到「依據：」為止；找不到時為 ""。 */
 fun extractSubject(fullText: String): String =
@@ -1115,11 +1126,13 @@ fun extractSubject(fullText: String): String =
 /**
  * 在文字中找符合 `pattern` 的說法 (如「本件係變價分割共有物，依民法第830條第2項準用第824條第7項規定，共有人有優先承買權…」)：
  * 回傳判定依據的句子，沒有時為 ""。子句中說法之前有「如、若、是否」的是假設或詢問，不算。
+ * 比對時去除空白 (「民法第 824 條」「分 割 共 有 物」) 並把全形數字改為半形 (「第８２４條」)，回傳的句子仍是原文。
  */
 fun findStatement(pattern: Regex, text: String): String {
     val joined = text.lines().joinToString("") { it.trim() }
     for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
-        for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
+        for (rawClause in sentence.split(Regex("""(?<=[，,])"""))) {
+            val clause = normalizeForMatch(rawClause)
             val m = pattern.find(clause) ?: continue
             if (Regex("""如|若|是否""").containsMatchIn(clause.substring(0, m.range.first))) continue
             return sentence.trim()
@@ -1127,6 +1140,10 @@ fun findStatement(pattern: Regex, text: String): String {
     }
     return ""
 }
+
+/** 去除空白並把全形數字改為半形，供 [findStatement] 比對用。 */
+fun normalizeForMatch(text: String): String =
+    text.filterNot { it.isWhitespace() }.map { if (it in '０'..'９') '0' + (it - '０') else it }.joinToString("")
 
 /** 公告結尾的承辦資訊 (函稿、股別、書記官…)，備註與使用情形都在此之前結束。 */
 val NOTICE_FOOTER = Regex("""^(?:函\s*稿|股\s*別|擬\s*判|民\s*事\s*執\s*行\s*處|司\s*法\s*事\s*務\s*官|書\s*記\s*官|法\s*官)""")
