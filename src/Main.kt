@@ -754,7 +754,7 @@ fun formatBuildingType(type: String): String {
     }
 }
 
-// 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2)
+// 提取權利範圍 (如：全部, 20000分之166, 100000分之264, 1/2, 公同共有10000分之19, 1分之1(公同共有))
 fun extractRightScope(text: String): String {
     // 移除備考之後的文字，避免誤取備考欄位中的持分註記（例如：備考 各1/2、備考 各83/20000）
     val textBeforeRemarks = if (text.contains("備考")) {
@@ -764,15 +764,15 @@ fun extractRightScope(text: String): String {
     }
 
     // 優先策略 1: 緊鄰最低拍賣價格前方的權利範圍 (例如 "全部 3,072,000元", "1分之1 2,816,000元", "10000分之61 948,000元")
-    val priceAdjacentRegex = Regex("""(?<scope>全部|\d+\s*(?:萬)?\s*分\s*之\s*\d+|\d+/\d+)\s+(?=\d{1,3}(?:,\d{3})+\s*元|\d+\s*元)""")
+    val priceAdjacentRegex = Regex("""(?<scope>(?:公同共有)?(?:全部|\d+\s*(?:萬)?\s*分\s*之\s*\d+|\d+/\d+)(?:[(（]公同共有[)）])?)\s+(?=\d{1,3}(?:,\d{3})+\s*元|\d+\s*元)""")
     val adjacentMatch = priceAdjacentRegex.find(textBeforeRemarks) ?: priceAdjacentRegex.find(text)
     if (adjacentMatch != null) {
         return adjacentMatch.groups["scope"]!!.value.replace(Regex("""\s+"""), "")
     }
 
     // 策略 2: 中文分數格式 (例如 20000分之166, 100000分之264, 5分之1)
-    val fractionMatch = Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(textBeforeRemarks) 
-        ?: Regex("""\d+\s*(?:萬)?\s*分\s*之\s*\d+""").find(text)
+    val fractionRegex = Regex("""(?:公同共有)?\d+\s*(?:萬)?\s*分\s*之\s*\d+(?:[(（]公同共有[)）])?""")
+    val fractionMatch = fractionRegex.find(textBeforeRemarks) ?: fractionRegex.find(text)
     if (fractionMatch != null) {
         return fractionMatch.value.replace(Regex("""\s+"""), "")
     }
@@ -792,25 +792,39 @@ fun extractRightScope(text: String): String {
 }
 
 /**
- * 依版面位置排序後，權利範圍欄常被最低拍賣價格欄截斷：分母留在該列價格之前
- * (「10000分之 5,950,000元」「100000 分 1,415,000元」)，分子落在下一行的行尾
- * (「166」「之249」「… 合計: 616.38 467」)。從該列價格前的片段接起後續各行的行尾片段。
- * 該列價格前已是完整的權利範圍 (「全部」「1分之1」) 時直接採用；拼不出「X分之Y」則回傳 ""。
+ * 依版面位置排序後，權利範圍欄常被最低拍賣價格欄截斷：欄位開頭留在該列價格之前
+ * (「10000分之 5,950,000元」「100000 分 1,415,000元」「公同共有7 8,720,000元」「4分之1(公 37,000,000元」)，
+ * 其餘落在下面幾行的行尾 (「166」「之249」「91000分之」「1528」「同共有)」「… 合計: 46.09 分之1」)。
+ * 從該列價格前的片段接起後續各行的行尾片段，保留欄位全部文字 (例如「公同共有791000分之1528」「4分之1(公同共有)」)。
+ * 拼不出完整的權利範圍 (見 [isCompleteRightScope]) 則回傳 ""。
  */
 fun extractSplitRightScope(lines: List<String>, rowIndex: Int): String {
     val price = """(?:\d{1,3}(?:,\d{3})+|\d+)\s*元"""
     val row = lines[rowIndex].trim()
-    val complete = Regex("""(?<scope>全部|\d+\s*分\s*之\s*\d+|\d+/\d+)\s+$price""").find(row)
-    if (complete != null) return complete.groups["scope"]!!.value.replace(Regex("""\s+"""), "")
-    val partial = Regex("""(?<![\d.,])(?<frag>\d+\s*分\s*之?|\d+)\s+$price""").find(row) ?: return ""
-    val scope = StringBuilder(partial.groups["frag"]!!.value.replace(Regex("""\s+"""), ""))
+    val head = Regex("""(?:^|\s)(?<frag>$RIGHT_SCOPE_HEAD)\s+$price""").find(row) ?: return ""
+    var lastFragment = head.groups["frag"]!!.value.replace(Regex("""\s+"""), "")
+    val scope = StringBuilder(lastFragment)
     for (i in rowIndex + 1 until minOf(rowIndex + 4, lines.size)) {
         val lastToken = lines[i].trim().split(Regex("""\s+""")).last()
-        if (!lastToken.matches(Regex("""[\d分之]+"""))) break
+        if (!lastToken.matches(Regex("""[\d分之公同共有()（）]+"""))) break
+        // 已完整時，數字開頭的片段只有在上一段寫滿欄寬 (「0000分之1」接「9」) 才是接續，否則是別欄的數字
+        if (isCompleteRightScope(scope.toString()) && lastToken.first().isDigit() && lastFragment.length < 6) break
         scope.append(lastToken)
+        lastFragment = lastToken
     }
-    return scope.toString().takeIf { it.matches(Regex("""\d+分之\d+""")) } ?: ""
+    return scope.toString().takeIf { isCompleteRightScope(it) } ?: ""
 }
+
+/**
+ * 權利範圍欄在價格前的開頭片段：「全部」「1分之1」「10000分之」「100000 分」「1/2」「4分之1(公」，
+ * 或「公同共有」開頭的「公同共有7」「公同共有」，連「公同共有」本身也可能被截斷 (「公同共」「公」)。
+ */
+const val RIGHT_SCOPE_HEAD =
+    """(?<![\d.,])(?:公同共有(?:全部|\d+/\d+|\d+(?:\s*分(?:\s*之(?:\s*\d+)?)?)?)?|公同共|公同|公|(?:全部|\d+/\d+|\d+(?:\s*分(?:\s*之(?:\s*\d+)?)?)?)(?:[(（][公同共有]*[)）]?)?)"""
+
+/** 完整的權利範圍：「全部」「1/2」「X分之Y」，可帶「公同共有」前綴或「(公同共有)」後綴。 */
+fun isCompleteRightScope(scope: String): Boolean =
+    scope.matches(Regex("""(?:公同共有)?(?:全部|\d+/\d+|\d+分之\d+)(?:[(（]公同共有[)）])?"""))
 
 // 提取最低拍賣價格 (如：717,000元, 3,072,000元, 8,300,000元)
 fun extractMinimalPrice(text: String): String {
