@@ -52,8 +52,10 @@ data class Batch(
     val usage: String,             // 使用情形
     val unnaturalDeath: Boolean,   // 是否曾發生非自然死亡 (凶宅)
     val unnaturalDeathEvidence: String, // 判定為凶宅所依據的句子；不是凶宅時為 ""
-    val partitionSale: Boolean,    // 是否為變價分割共有物
-    val partitionSaleEvidence: String, // 判定為變價分割共有物所依據的句子；不是時為 ""
+    val 分割變價拍賣: Boolean,      // 是否為分割共有物或分割遺產的變價拍賣
+    val 分割變價拍賣依據: String,   // 判定為分割變價拍賣所依據的句子；不是時為 ""
+    val 持分拍賣: Boolean,          // 是否僅拍賣所有權之應有部分 (持分)
+    val 持分拍賣依據: String,       // 判定為持分拍賣所依據的句子；不是時為 ""
     val remarks: String,           // 備註
     val landResults: List<LandLocation>,
     val buildingResults: List<BuildingInfo>,
@@ -134,7 +136,8 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * these four handover fields are always strings, "" when there is nothing to report, never null —
  * the sentences they were decided from as `handoverEvidence`, `usage` (使用情形), `remarks` (備註),
  * `unnaturalDeath` (是否曾發生非自然死亡，即凶宅) with the sentence it was decided from as `unnaturalDeathEvidence` (or null),
- * `partitionSale` (是否為變價分割共有物) with the sentence it was decided from as `partitionSaleEvidence` ("" when not),
+ * `partitionSale` (分割變價拍賣：分割共有物或分割遺產的變價拍賣) with the sentence it was decided from as `partitionSaleEvidence` ("" when not),
+ * `shareSale` (持分拍賣：僅拍賣所有權之應有部分) with the sentence it was decided from as `shareSaleEvidence` ("" when not),
  * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
  * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台),
  * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
@@ -186,8 +189,10 @@ fun batchJson(batch: Batch): String {
     sb.append("\"usage\":${jsonString(batch.usage.ifBlank { null })},")
     sb.append("\"unnaturalDeath\":${batch.unnaturalDeath},")
     sb.append("\"unnaturalDeathEvidence\":${jsonString(batch.unnaturalDeathEvidence.ifBlank { null })},")
-    sb.append("\"partitionSale\":${batch.partitionSale},")
-    sb.append("\"partitionSaleEvidence\":${jsonString(batch.partitionSaleEvidence)},")
+    sb.append("\"partitionSale\":${batch.分割變價拍賣},")
+    sb.append("\"partitionSaleEvidence\":${jsonString(batch.分割變價拍賣依據)},")
+    sb.append("\"shareSale\":${batch.持分拍賣},")
+    sb.append("\"shareSaleEvidence\":${jsonString(batch.持分拍賣依據)},")
     sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
     sb.append("\"landParcels\":[")
     sb.append(batch.landResults.mapIndexed { index, item ->
@@ -351,7 +356,8 @@ fun parseNotice(document: PDDocument): Notice {
     val biddingDateTime = extractBiddingDateTime(fullText)
     val openingPlace = extractOpeningPlace(sortedText)
 
-    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it) }
+    val subject = extractSubject(fullText)
+    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject) }
     val caseNumber = batches.map { it.caseNumber }.firstOrNull { it.isNotBlank() } ?: ""
     val owners = batches.map { it.owner }.filter { it.isNotBlank() }.distinct()
     return Notice(
@@ -364,8 +370,8 @@ fun parseNotice(document: PDDocument): Notice {
     )
 }
 
-/** 解析一個標別段落；土地與建物只在同一標別內對應。 */
-fun parseBatch(section: BatchSection): Batch {
+/** 解析一個標別段落；土地與建物只在同一標別內對應。`subject` 是公告的主旨，用來判定分割變價拍賣。 */
+fun parseBatch(section: BatchSection, subject: String = ""): Batch {
     val landResults = parseLandLocations(section.text)
     val buildingResults = parseBuildings(section.text)
     linkBuildingsToLand(landResults, buildingResults)
@@ -377,7 +383,9 @@ fun parseBatch(section: BatchSection): Batch {
     val remarks = extractRemarks(section.text)
     val handoverField = extractHandover(section.text)
     val handover = determineHandover(handoverField, usage + "\n" + remarks)
-    val partitionSaleEvidence = findPartitionSale(usage + "\n" + remarks)
+    val 分割變價拍賣依據 = findStatement(PARTITION_SALE, usage + "\n" + remarks)
+        .ifBlank { findStatement(PARTITION_SALE, subject) }
+    val 持分拍賣依據 = findStatement(SHARE_SALE, usage + "\n" + remarks)
     return Batch(
         batchNumber = section.batchNumber,
         caseNumber = caseNumber,
@@ -392,8 +400,10 @@ fun parseBatch(section: BatchSection): Batch {
         usage = usage,
         unnaturalDeath = unnaturalDeathEvidence.isNotBlank(),
         unnaturalDeathEvidence = unnaturalDeathEvidence,
-        partitionSale = partitionSaleEvidence.isNotBlank(),
-        partitionSaleEvidence = partitionSaleEvidence,
+        分割變價拍賣 = 分割變價拍賣依據.isNotBlank(),
+        分割變價拍賣依據 = 分割變價拍賣依據,
+        持分拍賣 = 持分拍賣依據.isNotBlank(),
+        持分拍賣依據 = 持分拍賣依據,
         remarks = remarks,
         landResults = landResults,
         buildingResults = buildingResults,
@@ -536,9 +546,13 @@ fun renderReport(notice: Notice): String {
         } else {
             row("☠️ 非自然死亡 (凶宅) Unnatural Death: 否 No")
         }
-        if (batch.partitionSale) {
-            row("⚖️ 變價分割共有物 Partition Sale: 是 Yes")
-            row("   " + batch.partitionSaleEvidence)
+        if (batch.分割變價拍賣) {
+            row("⚖️ 分割變價拍賣 Partition Sale: 是 Yes")
+            row("   " + batch.分割變價拍賣依據)
+        }
+        if (batch.持分拍賣) {
+            row("🧩 持分拍賣 (僅拍賣應有部分) Share Sale: 是 Yes")
+            row("   " + batch.持分拍賣依據)
         }
         batch.buildingAreaSqm?.let {
             row("📐 建物面積 Building Area: " + formatArea(it))
@@ -1082,18 +1096,31 @@ fun scanUnnaturalDeath(text: String): Pair<String, String> {
     return "" to rebutted
 }
 
-/** 變價分割共有物的說法 (「本件係變價分割共有物」「裁判分割共有物事件」)。 */
-val PARTITION_SALE = Regex("""變價分割|分割共有物""")
+/**
+ * 分割變價拍賣的說法：使用情形的「本件係變價分割共有物」，或主旨的「分割遺產（變價）強制執行事件」「分割共有物事件」。
+ */
+val PARTITION_SALE = Regex("""變價分割|分割共有物|分割遺產|遺產分割""")
 
 /**
- * 本標別是否為變價分割共有物 (如「本件係變價分割共有物，依民法第830條第2項準用第824條第7項規定，共有人有優先承買權…」)：
- * 回傳判定依據的句子，不是時為 ""。子句中說法之前有「如、若、是否」的是假設或詢問，不算。
+ * 持分拍賣的說法：「本件係拍賣建物所有權之應有部分」「本件僅拍賣不動產應有部分」「609-12地號土地僅拍賣債務人應有部分」。
+ * 「現場查封部分債務人應有部分時」沒有「拍賣」，不算。
  */
-fun findPartitionSale(text: String): String {
+val SHARE_SALE = Regex("""拍賣[^。；;，,]{0,15}(?:應有部分|持分)""")
+
+/** 公告的主旨 (「主旨：公告以投標方法拍賣本院114年度司執字第164545號分割遺產（變價）強制執行事件，…」)，到「依據：」為止；找不到時為 ""。 */
+fun extractSubject(fullText: String): String =
+    Regex("""主\s*旨\s*[:：]([\s\S]*?)(?:依\s*據\s*[:：]|公\s*告\s*事\s*項|$)""").find(fullText)
+        ?.groupValues?.get(1)?.lines()?.joinToString("") { it.trim() } ?: ""
+
+/**
+ * 在文字中找符合 `pattern` 的說法 (如「本件係變價分割共有物，依民法第830條第2項準用第824條第7項規定，共有人有優先承買權…」)：
+ * 回傳判定依據的句子，沒有時為 ""。子句中說法之前有「如、若、是否」的是假設或詢問，不算。
+ */
+fun findStatement(pattern: Regex, text: String): String {
     val joined = text.lines().joinToString("") { it.trim() }
     for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
         for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
-            val m = PARTITION_SALE.find(clause) ?: continue
+            val m = pattern.find(clause) ?: continue
             if (Regex("""如|若|是否""").containsMatchIn(clause.substring(0, m.range.first))) continue
             return sentence.trim()
         }
