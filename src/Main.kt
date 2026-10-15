@@ -357,7 +357,8 @@ fun parseNotice(document: PDDocument): Notice {
     val openingPlace = extractOpeningPlace(sortedText)
 
     val subject = extractSubject(fullText) + "\n" + extractBasis(fullText)
-    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject) }
+    val buildingCells = extractBuildingCells(document)
+    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject, buildingCells) }
     val caseNumber = batches.map { it.caseNumber }.firstOrNull { it.isNotBlank() } ?: ""
     val owners = batches.map { it.owner }.filter { it.isNotBlank() }.distinct()
     return Notice(
@@ -371,20 +372,20 @@ fun parseNotice(document: PDDocument): Notice {
 }
 
 /** 解析一個標別段落；土地與建物只在同一標別內對應。`subject` 是公告的主旨與依據，用來判定分割變價拍賣。 */
-fun parseBatch(section: BatchSection, subject: String = ""): Batch {
+fun parseBatch(section: BatchSection, subject: String = "", buildingCells: List<BuildingCells> = emptyList()): Batch {
     val landResults = parseLandLocations(section.text)
-    val buildingResults = parseBuildings(section.text)
+    val buildingResults = parseBuildings(section.text, buildingCells)
     linkBuildingsToLand(landResults, buildingResults)
     val (caseNumber, owner) = extractCaseNumberAndOwner(section.text)
     val deposit = extractDeposit(section.text)
     val minimalPriceTotal = extractMinimalPriceTotal(section.text)
-    val (unnaturalDeathEvidence, rebuttedUnnaturalDeath) = scanUnnaturalDeath(section.text)
+    val (unnaturalDeathEvidence, rebuttedUnnaturalDeath, uncertainUnnaturalDeath) = scanUnnaturalDeath(section.text)
     val usage = extractUsage(section.text)
     val remarks = extractRemarks(section.text)
     val handoverField = extractHandover(section.text)
     val handover = determineHandover(handoverField, usage + "\n" + remarks)
     val 分割變價拍賣依據 = findStatement(PARTITION_SALE, usage + "\n" + remarks)
-        .ifBlank { findStatement(PARTITION_SALE, subject) }
+        .ifBlank { findStatement(SUBJECT_PARTITION_SALE, subject) }
     val 持分拍賣依據 = findStatement(SHARE_SALE, usage + "\n" + remarks)
     return Batch(
         batchNumber = section.batchNumber,
@@ -409,8 +410,12 @@ fun parseBatch(section: BatchSection, subject: String = ""): Batch {
         buildingResults = buildingResults,
         warnings = computeBatchWarnings(landResults, buildingResults, deposit, minimalPriceTotal, owner) + handover.warnings +
             listOfNotNull(rebuttedUnnaturalDeath.ifBlank { null }?.let {
-                "有人稱曾發生非自然死亡，但經查證死亡地點不在本件標的，判定為非凶宅 " +
-                    "(A death was claimed, but the place of death was verified to be elsewhere; not flagged): $it"
+                "有人稱曾發生非自然死亡，但死亡地點不在本件標的，判定為非凶宅 " +
+                    "(A death was mentioned, but it happened outside this property; not flagged): $it"
+            }) +
+            listOfNotNull(uncertainUnnaturalDeath.ifBlank { null }?.takeIf { unnaturalDeathEvidence.isBlank() }?.let {
+                "有疑似或傳聞的非自然死亡說法，但無法明確確認，依原則判定為非凶宅 " +
+                    "(An unnatural death was only suspected or rumoured, not confirmed; not flagged): $it"
             })
     )
 }
@@ -1071,43 +1076,106 @@ val UNNATURAL_DEATH_POSITIVE = Regex(
 /** 否定或詢問的說法 (如「並無發生非自然死亡情形」「未發現有非自然死亡情事」「查詢有無…」「是否為…」)。 */
 val UNNATURAL_DEATH_NEGATION = Regex("""無|未|沒有|不曾|是否""")
 
-/** 查證死亡地點不在本件標的 (「死亡地點係…療養院非本件拍賣標的」「並非於本件建物內死亡」)。 */
+/**
+ * 查證死亡地點不在本件標的：
+ * 「死亡登記申請書上記載死亡地點係臺北市臺灣療養院非本件拍賣標的」「死亡處所係新北市…5樓之3，並非本件拍賣標的」
+ * 「並非於本件建物內死亡」「與本件拍賣標的無涉」。
+ */
 val UNNATURAL_DEATH_REBUTTAL = Regex(
-    """死亡地點[^。；]{0,30}?(?:非|並非|不是|不在)""" +
-        """|(?:非|並非|不是)(?:在|於)?(?:本件|本|該)?(?:拍賣)?(?:建物|房屋|標的物?)(?:內|中)?(?:死亡|身亡|過世|發生)"""
+    """(?:死亡|過世|身亡|往生)(?:地點|處所|場所)[^。；]{0,60}?(?:非(?!自然)|並非|不是|不在)""" +
+        """|(?:非|並非|不是)(?:在|於)?(?:本件|本|該)?(?:拍賣)?(?:建物|房屋|標的物?)(?:內|中)?(?:死亡|身亡|過世|發生)""" +
+        """|(?:與|和)(?:本件|本|該)(?:拍賣)?(?:建物|房屋|標的物?)無(?:涉|關)"""
 )
 
 /**
- * 本標別是否曾發生非自然死亡 (凶宅)：回傳 (判定依據的句子, 被查證推翻的句子)，沒有時各為 ""。
+ * 說法所指的地點註明不是本件標的 (「10幾年前7樓(非本件拍賣標的)曾有自殺事件」「隔壁棟非屬本件標的，曾發生命案」)，
+ * 即事件發生在別戶，不是本件。
+ */
+val NOT_THIS_PROPERTY = Regex("""(?:非|並非|不是|非屬|不屬)(?:於|在)?(?:本件|本案)(?:之)?(?:拍賣)?(?:標的物?|建物|房屋|範圍)""")
+
+/** 查證的死亡地點是醫療或安養機構 (「死亡地點為臺北市立聯合醫院和平院區」)，即不在本件標的。 */
+val UNNATURAL_DEATH_AT_FACILITY = Regex(
+    """(?:死亡|過世|身亡|往生)(?:地點|處所|場所)[:：]?(?:係|為|在|於)?[^。；，,]{0,30}?(?:醫院|療養院|醫學中心|診所|護理之家|安養中心|養護中心|長照)"""
+)
+
+/** 在本件受傷後才送醫死亡 (「送醫後不治」)：死亡地點在醫院也不能推翻。 */
+val TAKEN_TO_HOSPITAL = Regex("""送醫|送往|急救|搶救|就醫""")
+
+/** 使用情形的項目開頭 (「⑵」「二、」「2、」「（二）」)，下一項就不再是同一件事的查證。 */
+val USAGE_ITEM_START = Regex("""^(?:[⑴-⒇]|[一二三四五六七八九十]+、|\d+[、.]|[(（][一二三四五六七八九十\d]+[)）])""")
+
+/** 說法之後 (`following`) 是否查證死亡地點不在本件標的；送醫後才死亡的，醫療機構不算推翻。 */
+fun isDeathRebutted(claim: String, following: String): Boolean =
+    UNNATURAL_DEATH_REBUTTAL.containsMatchIn(following) ||
+        (UNNATURAL_DEATH_AT_FACILITY.containsMatchIn(following) && !TAKEN_TO_HOSPITAL.containsMatchIn(claim + following))
+
+/**
+ * 只是疑似或傳聞的說法 (「該屋疑似有發生過非自然死亡情事」「聽說是房屋內有人上吊」)，無法明確確認。
+ * 「據現住人稱…曾有親屬在建物二樓房間服藥及燒炭自殺」是當事人明確的陳述，「稱」不算。
+ */
+val UNNATURAL_DEATH_UNCERTAIN = Regex("""疑似|聽說|據聞|傳聞|未經證實|無法證實|無從證實|無法查證|無從查證|尚待查證|不確定""")
+
+/** [scanUnnaturalDeath] 的結果：判定依據、被查證推翻的句子、無法確認的句子，沒有時各為 ""。 */
+data class UnnaturalDeathScan(val evidence: String, val rebutted: String, val uncertain: String)
+
+/**
+ * 本標別是否曾發生非自然死亡 (凶宅)。大原則：無法明確確認的，一律判定為非凶宅。
  * 公告多半只是例行說明 (「並無發生非自然死亡情形」「如…建物內有非自然死亡事件等…於使用情形欄載明」)，
  * 所以只認明確的說法，且該子句 (以「，。；」切開) 在說法之前不能有否定或詢問的字，也不能是「如…等」的舉例。
- * 說法之後同一句若查證死亡地點不在本件標的
- * (「另有其妹在屋內自殺身亡情事，惟經本院向戶政機關函查，死亡登記申請書上記載死亡地點係臺北市臺灣療養院非本件拍賣標的」)，
- * 就不算凶宅，改回傳為被推翻的句子以便提醒。
+ * 說法之後同一句或下一句 (同一項內) 若查證死亡地點不在本件標的
+ * (「另有其妹在屋內自殺身亡情事，惟經本院向戶政機關函查，死亡登記申請書上記載死亡地點係臺北市臺灣療養院非本件拍賣標的」
+ * 「…上吊身亡，惟經函查戶政機關，死亡地點為臺北市立聯合醫院和平院區」)，
+ * 或說法所指的地點註明不是本件標的 (「經訪查總幹事稱10幾年前7樓(非本件拍賣標的)曾有自殺事件」)，
+ * 就不算凶宅，改記為被推翻的句子以便提醒。
+ * 整句只是疑似或傳聞 (見 [UNNATURAL_DEATH_UNCERTAIN]) 的也不算，記為無法確認的句子；
+ * 同一標別另有明確的說法 (「五、本件標的房屋曾發生過非自然死亡情事，請投標人留意。」) 才判定為凶宅。
  */
-fun scanUnnaturalDeath(text: String): Pair<String, String> {
+fun scanUnnaturalDeath(text: String): UnnaturalDeathScan {
     val joined = text.lines().joinToString("") { it.trim() }
+    // 欄位標題 (「使用情形 一、…」「備註 一、…」) 也是句子的開頭，否則表格文字會黏在第一句前面
+    val sentences = joined.split(Regex("""(?<=[。；;])|(?=使用情形\s)|(?=備\s*註\s)"""))
     var rebutted = ""
-    for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
+    var uncertain = ""
+    for ((index, sentence) in sentences.withIndex()) {
+        val next = sentences.getOrNull(index + 1)?.trim()?.takeUnless { it.isEmpty() || USAGE_ITEM_START.containsMatchIn(it) } ?: ""
         var offset = 0
+        var previousClause = ""
         for (clause in sentence.split(Regex("""(?<=[，,])"""))) {
             val clauseStart = offset
             offset += clause.length
+            val precedingClause = previousClause
+            previousClause = clause
             val m = UNNATURAL_DEATH_POSITIVE.find(clause) ?: continue
             val before = clause.substring(0, m.range.first)
             val after = clause.substring(m.range.last + 1)
             if (UNNATURAL_DEATH_NEGATION.containsMatchIn(before)) continue
             // 舉例的清單 (「如海砂屋、…、自殺等」) 不是說本件發生過
             if (before.contains("如") && after.contains("等")) continue
-            // 同一句接著查證死亡地點不在本件標的
-            if (UNNATURAL_DEATH_REBUTTAL.containsMatchIn(sentence.substring(clauseStart + m.range.last + 1))) {
+            // 說法所指的地點註明不是本件標的 (「7樓(非本件拍賣標的)曾有自殺事件」)
+            if (NOT_THIS_PROPERTY.containsMatchIn(precedingClause + clause)) {
                 if (rebutted.isEmpty()) rebutted = sentence.trim()
                 break
             }
-            return sentence.trim() to ""
+            // 同一句或下一句接著查證死亡地點不在本件標的
+            val restOfSentence = sentence.substring(clauseStart + m.range.last + 1)
+            val claim = sentence.substring(0, clauseStart + m.range.last + 1)
+            if (isDeathRebutted(claim, restOfSentence)) {
+                if (rebutted.isEmpty()) rebutted = sentence.trim()
+                break
+            }
+            if (next.isNotEmpty() && isDeathRebutted(claim, next)) {
+                if (rebutted.isEmpty()) rebutted = sentence.trim() + next
+                break
+            }
+            // 只是疑似或傳聞，無法明確確認
+            if (UNNATURAL_DEATH_UNCERTAIN.containsMatchIn(sentence)) {
+                if (uncertain.isEmpty()) uncertain = sentence.trim()
+                break
+            }
+            return UnnaturalDeathScan(sentence.trim(), "", "")
         }
     }
-    return "" to rebutted
+    return UnnaturalDeathScan("", rebutted, uncertain)
 }
 
 /**
@@ -1127,6 +1195,13 @@ val PARTITION_SALE = Regex(
  * 「現場查封部分債務人應有部分時」沒有「拍賣」，不算。
  */
 val SHARE_SALE = Regex("""拍賣[^。；;，,]{0,15}(?:應有部分|持分)""")
+
+/**
+ * 主旨與依據中的分割變價拍賣：「分割遺產（變價）強制執行事件」或依據「強制執行法第131條」。
+ * 只寫「分割遺產強制執行事件」且依據第81條的 (114年司執字第160931號，「債務人陳榮富所有」)，
+ * 是執行分割遺產判決中的金錢給付，拍賣的是單一債務人的財產，不是變價分割。
+ */
+val SUBJECT_PARTITION_SALE = Regex("""[（(]變價[）)]|強制執行法第131條""")
 
 /** 公告的依據 (「依據：強制執行法第131條第2項準用第81條。」)；找不到時為 ""。 */
 fun extractBasis(fullText: String): String =
@@ -1335,7 +1410,9 @@ fun determineBuildingType(totalFloors: Int?, locatedFloor: String, blockText: St
 
 /** Same decision as [determineBuildingType], plus the name of the rule that made it. */
 fun determineBuildingTypeWithRule(totalFloors: Int?, locatedFloor: String, blockText: String, primaryType: String? = null): Pair<String, String> {
-    val isCommonArea = blockText.contains("共同使用部分") || blockText.contains("公設")
+    // 備考常寫「含共同使用部分1772建號」，那是本建物附帶的公設，只有備考之前的建物列本身寫共同使用部分才是公設建號
+    val rowText = blockText.lines().takeWhile { !it.trim().startsWith("備考") }.joinToString("\n")
+    val isCommonArea = rowText.contains("共同使用部分") || rowText.contains("公設")
     if (isCommonArea) {
         return Pair(primaryType ?: "elevator", if (primaryType != null) "common-area:inherited" else "common-area:default")
     }
@@ -1380,6 +1457,19 @@ fun determineBuildingTypeWithRule(totalFloors: Int?, locatedFloor: String, block
     return Pair("elevator", "default")
 }
 
+/** 土地表格的表頭「土地坐落」(字間常有全形空白)。 */
+val LAND_TABLE_HEADER = Regex("""土[\s\u3000]*地[\s\u3000]*坐[\s\u3000]*落""")
+
+/**
+ * 地號欄寬不夠時，補零的子號會被截到下一行開頭：「1835-00 1137 10000分之 1,920,000元」接「01 186」→「1835-0001」。
+ * 只有子號以 0 開頭且不滿 4 位、下一行開頭的數字剛好補滿 4 位時才接起來；「1835-1」這類完整的地號不動。
+ */
+fun joinWrappedLandNumber(landNo: String, nextLine: String?): String {
+    val suffix = Regex("""-(0\d{0,2})$""").find(landNo)?.groupValues?.get(1) ?: return landNo
+    val head = nextLine?.trim()?.let { Regex("""^(\d{1,3})(?:\s|$)""").find(it) }?.groupValues?.get(1) ?: return landNo
+    return if (suffix.length + head.length == 4) landNo + head else landNo
+}
+
 fun parseLandLocations(attachmentText: String): List<LandLocation> {
     val results = mutableListOf<LandLocation>()
     val lines = attachmentText.lines()
@@ -1403,7 +1493,8 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
             continue
         }
 
-        if (trimmed.contains("土地坐落") || (trimmed.contains("土") && trimmed.contains("地") && trimmed.contains("坐"))) {
+        // 表頭「土　　地　　坐　　落」；使用情形中的「1835-2地號土地上坐落武廟路」不是表頭
+        if (LAND_TABLE_HEADER.containsMatchIn(trimmed)) {
             isInsideLandTable = true
         }
 
@@ -1429,7 +1520,7 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
                     val subSection = match.safeGroupValue("subSection").let {
                         if (it.isBlank() || it.endsWith("小段")) it else it + "小段"
                     }
-                    val landNo = match.safeGroupValue("landNo")
+                    val landNo = joinWrappedLandNumber(match.safeGroupValue("landNo"), lines.getOrNull(index + 1))
 
                     if (landNo.isNotBlank() && section.length >= 2 && 
                         !section.contains("縣") && !section.contains("市") && 
@@ -1476,7 +1567,8 @@ fun extractBuildingArea(rowText: String): Pair<BigDecimal?, BigDecimal> {
     val number = """\d+(?:\.\d+)?"""
     val total = Regex("""合\s*計\s*[:：]\s*(?<v>$number)""").find(rowText)
         ?.groups?.get("v")?.value?.toBigDecimal() ?: return Pair(null, BigDecimal.ZERO)
-    val balconies = Regex("""陽\s*[台臺]\s*[:：(（]?\s*(?<v>$number)""").findAll(rowText)
+    // 「陽台7.14」「陽台: 25.37」「陽臺，面積15.43」
+    val balconies = Regex("""陽\s*[台臺]\s*(?:[，,]\s*)?(?:面\s*積\s*)?[:：(（]?\s*(?<v>$number)""").findAll(rowText)
         .map { it.groups["v"]!!.value.toBigDecimal() }.toList()
     val balcony = balconies.fold(BigDecimal.ZERO, BigDecimal::add)
     // 樓層面積欄 (「標示: 數字」) 除合計以外的加總剛好等於合計，代表其中的陽台已算進合計
@@ -1487,6 +1579,140 @@ fun extractBuildingArea(rowText: String): Pair<BigDecimal?, BigDecimal> {
     val entrySum = entries.fold(BigDecimal.ZERO) { acc, m -> acc.add(m.groups["v"]!!.value.toBigDecimal()) }
     val included = balconyListed && entrySum.compareTo(total) == 0
     return Pair(total, if (included) BigDecimal.ZERO else balcony)
+}
+
+/**
+ * 依欄位位置取出的一列建物：建號、基地坐落/建物門牌、建築式樣 (主要建築材料及房屋層數)、樓層面積與附屬建物欄的文字，欄內拆行已接回。
+ */
+data class BuildingCells(
+    val buildingNumber: String,
+    val floorArea: String,
+    val annex: String,
+    val location: String = "",
+    val structure: String = ""
+)
+
+/**
+ * 依文字的 x 座標取出建物表格各列的建號、樓層面積與附屬建物欄。
+ * 依版面排序後的文字會把同一行各欄混在一起，欄寬不夠而拆行的內容就分不出屬於哪一欄：
+ * 例如附屬建物欄「陽臺，面積1」接「5.43」，同一列下一行行尾的「55.02」卻是樓層面積欄的。
+ * 表頭「建號」「樓 層 面 積」「附屬建物主」「權利範圍」的 x 座標就是各欄的左緣 (資料靠左對齊)，
+ * 每列從編號欄有數字的那一行起，到「備考」為止，各欄逐行的片段依 [joinCellLines] 接起來。
+ */
+fun extractBuildingCells(document: PDDocument): List<BuildingCells> {
+    data class Glyph(val page: Int, val x: Float, val y: Float, val text: String)
+    val glyphs = mutableListOf<Glyph>()
+    val stripper = object : PDFTextStripper() {
+        override fun writeString(text: String, textPositions: List<TextPosition>) {
+            for (t in textPositions) {
+                if (t.unicode.isBlank() || t.xDirAdj < MARGIN_LINE_NUMBER_MAX_X) continue
+                glyphs.add(Glyph(currentPageNo, t.xDirAdj, t.yDirAdj, t.unicode))
+            }
+        }
+    }
+    stripper.sortByPosition = true
+    stripper.getText(document)
+
+    // 同一頁 y 相差 3 以內的字算同一行，行內依 x 排序
+    val lines = mutableListOf<List<Glyph>>()
+    for ((_, pageGlyphs) in glyphs.groupBy { it.page }.toSortedMap()) {
+        var current = mutableListOf<Glyph>()
+        for (g in pageGlyphs.sortedBy { it.y }) {
+            if (current.isNotEmpty() && g.y - current.first().y > 3f) {
+                lines.add(current.sortedBy { it.x }); current = mutableListOf()
+            }
+            current.add(g)
+        }
+        if (current.isNotEmpty()) lines.add(current.sortedBy { it.x })
+    }
+    fun text(line: List<Glyph>) = line.joinToString("") { it.text }
+    fun xOf(line: List<Glyph>, word: String): Float? {
+        val i = text(line).indexOf(word)
+        return if (i < 0) null else line[i].x
+    }
+
+    class Columns(val bldgNo: Float, val base: Float, val structure: Float, val floor: Float, val annex: Float, val scope: Float)
+    class Row {
+        val no = StringBuilder()
+        val location = mutableListOf<String>()
+        val structure = mutableListOf<String>()
+        val floor = mutableListOf<String>()
+        val annex = mutableListOf<String>()
+    }
+    var columns: Columns? = null
+    val results = mutableListOf<BuildingCells>()
+    var row: Row? = null
+    var inRemark = false
+    fun finishRow() {
+        row?.let {
+            if (it.no.isNotEmpty()) results.add(
+                BuildingCells(
+                    it.no.toString(), joinCellLines(it.floor), joinCellLines(it.annex),
+                    location = it.location.joinToString(""), structure = it.structure.joinToString("")
+                )
+            )
+        }
+        row = null
+    }
+    fun cell(line: List<Glyph>, from: Float, to: Float) = line.filter { it.x >= from - 3 && it.x < to - 3 }.joinToString("") { it.text }
+    for ((index, line) in lines.withIndex()) {
+        val t = text(line)
+        if (t.contains("附屬建物主")) {
+            finishRow()
+            // 表頭分佈在附近幾行 (「附屬建物主」「編號 建號 … 樓 層 面 積 … 權利範圍」)；
+            // 表頭沒有數字，附近有數字的是資料列 (如備考「…3934建號」「(權利範圍:917088分之1228)」)
+            val header = lines.subList(maxOf(0, index - 3), minOf(lines.size, index + 4)).filter { l -> text(l).none { it.isDigit() } }
+            val annex = xOf(line, "附屬建物主")!!
+            val bldgNo = header.firstNotNullOfOrNull { xOf(it, "建號") }
+            val floor = header.firstNotNullOfOrNull { l -> xOf(l, "樓").takeIf { text(l).contains("積") } }
+            val scope = header.firstNotNullOfOrNull { xOf(it, "權利範圍") }
+            val base = header.firstNotNullOfOrNull { xOf(it, "--------------") ?: xOf(it, "基") }
+            val structure = header.firstNotNullOfOrNull { xOf(it, "建築式") ?: xOf(it, "樣主要") }
+            columns = if (bldgNo != null && floor != null && scope != null && base != null && structure != null) {
+                Columns(bldgNo, base, structure, floor, annex, scope)
+            } else null
+            continue
+        }
+        val c = columns ?: continue
+        // 頁碼與「(續上頁)」不屬於任何一欄
+        if (Regex("""^(?:第[一二三四五六七八九十\d]{1,4}頁|[(（]續上頁[)）])$""").matches(t)) continue
+        if (Regex("""點交|使用情形|土[\s\u3000]*地[\s\u3000]*坐|標別""").containsMatchIn(t)) { finishRow(); columns = null; continue }
+        val first = line.first()
+        // 編號欄 (建號欄左邊) 有數字：新的一列
+        if (first.x < c.bldgNo - 5 && first.text.first().isDigit()) { finishRow(); row = Row(); inRemark = false }
+        if (xOf(line, "備考")?.let { it < c.base } == true) inRemark = true
+        val current = row ?: continue
+        if (inRemark) continue
+        current.no.append(cell(line, c.bldgNo, c.base))
+        cell(line, c.base, c.structure).takeIf { it.isNotEmpty() }?.let { current.location.add(it) }
+        cell(line, c.structure, c.floor).takeIf { it.isNotEmpty() }?.let { current.structure.add(it) }
+        cell(line, c.floor, c.annex).takeIf { it.isNotEmpty() }?.let { current.floor.add(it) }
+        cell(line, c.annex, c.scope - 3).takeIf { it.isNotEmpty() }?.let { current.annex.add(it) }
+    }
+    finishRow()
+    return results
+}
+
+/**
+ * 建號欄寬不夠時，5 位數的建號會拆成兩行 (「1527」接「2」→ 15272)，依版面排序的文字只看得到第一行。
+ * 依欄位位置取出的建號 `fromCells` 是 `fromText` 再接上數字時，就是同一個建號被截斷了。
+ */
+fun isWrappedBuildingNumber(fromText: String, fromCells: String): Boolean =
+    fromCells.length > fromText.length && fromCells.startsWith(fromText) && fromCells.drop(fromText.length).all { it.isDigit() }
+
+/**
+ * 把欄內逐行的片段接成一段：以數字或小數點開頭、又沒有「:」的片段是上一行被截斷的後半，直接接上
+ * (「陽臺，面積1」+「5.43」→「陽臺，面積15.43」、「一層雨遮27.」+「56、二層陽」)；其餘以空白隔開
+ * (「一層:61.67」「二層:64.66」)。
+ */
+fun joinCellLines(fragments: List<String>): String {
+    val sb = StringBuilder()
+    for (f in fragments) {
+        val continues = sb.isNotEmpty() && (f.first().isDigit() || f.first() == '.') && !f.contains(':') && !f.contains('：')
+        if (sb.isNotEmpty() && !continues) sb.append(' ')
+        sb.append(f)
+    }
+    return sb.toString()
 }
 
 /**
@@ -1503,7 +1729,14 @@ fun extractBaseLocation(rowRest: String, followingLines: List<String>): String {
     }
 }
 
-fun parseBuildings(attachmentText: String): List<BuildingInfo> {
+/**
+ * 暫編建號的建物列：建號欄寫「暫編」(尚未登記的建物)，號碼常因欄寬不夠接到下一行開頭，
+ * 例如「2 暫 編 宜蘭縣冬山鄉八 合計: 0.0 一層雨遮27. 全部 426,000元」接「449 仙段876、885、8 56、二層陽」→ 建號「暫編449」。
+ * 權利範圍與最低拍賣價格在「暫 編」這一行，所以這一列要從這行算起。
+ */
+val TEMP_BUILDING_ROW = Regex("""^(?:(?<itemNo>\d+)\s+)?暫\s*編\s*(?:(?<num>\d{1,5})(?:\s|$))?\s*(?<rest>.*)$""")
+
+fun parseBuildings(attachmentText: String, buildingCells: List<BuildingCells> = emptyList()): List<BuildingInfo> {
     val results = mutableListOf<BuildingInfo>()
     val lines = attachmentText.lines()
 
@@ -1511,9 +1744,12 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
     val bldgIndices = mutableListOf<Pair<Int, String>>()
     var endIdx = lines.size
     val bldgRowRegex = Regex("""^(?:(?<itemNo>\d+)\s+)?(?<bldgNo>\d{2,5})\s+(?<rest>.*)$""")
+    // 暫編建號接在下一行開頭時，那一行是同一列的延續，不是另一個建物
+    val wrappedTempNumberLines = mutableSetOf<Int>()
 
     for ((i, line) in lines.withIndex()) {
         val trimmed = line.trim()
+        if (i in wrappedTempNumberLines) continue
         if (trimmed.contains("建號") || trimmed.contains("建 號")) inBldg = true
         if (inBldg && (trimmed.contains("使用情形") || trimmed.contains("點交情形") || trimmed.contains("點交否"))) {
             inBldg = false
@@ -1524,6 +1760,17 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             if (trimmed.contains("編號") || trimmed.contains("門牌") || trimmed.contains("備考") || 
                 trimmed.contains("公尺") || trimmed.contains("權利範圍") || (trimmed.contains("第") && trimmed.contains("頁"))) {
                 continue
+            }
+            val temp = TEMP_BUILDING_ROW.find(trimmed)
+            if (temp != null) {
+                val inline = temp.groups["num"]?.value
+                val wrapped = if (inline == null) lines.getOrNull(i + 1)?.trim()?.let { Regex("""^(\d{1,5})(?:\s|$)""").find(it) }?.groupValues?.get(1) else null
+                val num = inline ?: wrapped
+                if (num != null) {
+                    bldgIndices.add(Pair(i, "暫編$num"))
+                    if (wrapped != null) wrappedTempNumberLines.add(i + 1)
+                    continue
+                }
             }
             val m = bldgRowRegex.find(trimmed)
             if (m != null) {
@@ -1544,25 +1791,33 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
         val blockText = blockLines.joinToString("\n")
         
         val firstLine = lines[start].trim()
-        val firstMatch = bldgRowRegex.find(firstLine)
-        val rest = extractBaseLocation(firstMatch?.groups["rest"]?.value ?: "", blockLines.drop(1))
+        val firstMatch = TEMP_BUILDING_ROW.find(firstLine) ?: bldgRowRegex.find(firstLine)
+        // 暫編建號在下一行開頭 (「449 仙段876、885、8 56、二層陽」) 時，基地坐落從號碼之後接起
+        val continuation = blockLines.drop(1).mapIndexed { j, l ->
+            if (j == 0 && start + 1 in wrappedTempNumberLines) l.trim().replaceFirst(Regex("""^\d{1,5}\s*"""), "") else l
+        }
+        val rest = extractBaseLocation(firstMatch?.groups["rest"]?.value ?: "", continuation)
 
         val scope = extractSplitRightScope(lines, start).ifBlank { extractRightScope(blockText) }
         val price = extractMinimalPrice(blockText)
-        val (floors, located) = extractFloorInfo(blockText)
-        val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
-        val isCommonArea = blockText.contains("共同使用部分") || blockText.contains("公設")
-        // 備考常寫「含共同使用部分1772建號」，只看備考之前的建物列本身：共同使用部分的合計是整棟公設面積，不算建物面積
+        // 備考常寫「含共同使用部分1772建號」，只看備考之前的建物列本身
         val rowText = blockLines.takeWhile { !it.trim().startsWith("備考") }.joinToString("\n")
+        // 依欄位位置取出的各欄 (拆行已接回) 優先，否則用混在一起的列文字
+        val cells = buildingCells.firstOrNull { it.buildingNumber == bldgNo }
+            ?: buildingCells.firstOrNull { isWrappedBuildingNumber(bldgNo, it.buildingNumber) }
+        // 房屋層數在建築式樣欄 (「住家用，鋼筋混凝土造三層」)，所在樓層在樓層面積欄 (「7層:」) 或門牌 (「43號7樓」)
+        val (floors, located) = extractFloorInfo(cells?.let { listOf(it.structure, it.floorArea, it.location).joinToString("\n") } ?: rowText)
+        val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
+        // 共同使用部分的合計是整棟公設面積，不算建物面積
         val isCommonAreaRow = rowText.contains("共同使用部分") || rowText.contains("公設")
-        val (floorArea, balcony) = extractBuildingArea(rowText)
-        if (firstMainType == null && !isCommonArea) {
+        val (floorArea, balcony) = extractBuildingArea(cells?.let { it.floorArea + "\n" + it.annex } ?: rowText)
+        if (firstMainType == null && !isCommonAreaRow) {
             firstMainType = bType
         }
 
         val item = BuildingInfo(
             id = (results.size + 1).toString(),
-            buildingNumber = bldgNo,
+            buildingNumber = cells?.buildingNumber ?: bldgNo,
             baseLocation = rest,
             rightScope = scope,
             buildingMinimalPrice = price,
@@ -1570,7 +1825,7 @@ fun parseBuildings(attachmentText: String): List<BuildingInfo> {
             locatedFloor = located,
             buildingType = bType,
             buildingTypeRule = bTypeRule,
-            commonArea = isCommonArea,
+            commonArea = isCommonAreaRow,
             floorAreaSqm = floorArea,
             balconySqm = balcony,
             areaSqm = if (isCommonAreaRow) null else floorArea?.add(balcony)
