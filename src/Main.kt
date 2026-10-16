@@ -756,6 +756,7 @@ fun formatLocatedFloor(floor: String): String {
     if (floor.contains("~")) {
         return "$floor 樓 (Floors $floor)"
     }
+    Regex("""B(\d+)""").matchEntire(floor)?.let { return "$floor (Basement ${it.groupValues[1]})" }
     if (floor.contains("地下")) {
         return "$floor (Basement)"
     }
@@ -1391,6 +1392,9 @@ fun extractRawOpeningPlace(text: String): String {
     return opening
 }
 
+/** 地下樓層標成 B1、B2… (「地下一層」「地下2樓」「地下三層」→ B1、B2、B3)；層數不是數字時保留「地下X樓」。 */
+fun basementFloor(num: Int?, raw: String): String = if (num != null) "B$num" else "地下${raw}樓"
+
 // 提取總樓層與所在樓層資訊
 fun extractFloorInfo(blockText: String): Pair<Int?, String> {
     if (blockText.contains("共同使用部分") || blockText.contains("公設")) {
@@ -1428,7 +1432,7 @@ fun extractFloorInfo(blockText: String): Pair<Int?, String> {
             val raw = basementMatch.groups["bLevel"]?.value ?: ""
             val digitPart = raw.removePrefix("地下")
             val num = chineseNumberToInt(digitPart)
-            locatedFloor = "地下" + (num ?: digitPart) + "樓"
+            locatedFloor = basementFloor(num, digitPart)
         }
         
         if (locatedFloor.isBlank()) {
@@ -1465,7 +1469,7 @@ fun extractFloorInfo(blockText: String): Pair<Int?, String> {
             val raw = doorBasementMatch.groups["bLevel"]?.value?.replace(Regex("""\s+"""), "") ?: ""
             val digitPart = raw.removePrefix("地下")
             val num = chineseNumberToInt(digitPart)
-            locatedFloor = "地下" + (num ?: digitPart) + "樓"
+            locatedFloor = basementFloor(num, digitPart)
         }
         if (locatedFloor.isBlank()) {
             val doorTopMatch = Regex("""號\s*(?<top>(?:\d+|[一二三四五六七八九十]+)\s*[層樓]\s*頂(?:\s*未登記)?)""").find(blockText)
@@ -1528,7 +1532,7 @@ fun determineBuildingTypeWithRule(totalFloors: Int?, locatedFloor: String, block
         if (distinctAreaFloors > 1 || locatedFloor.contains("~")) {
             return Pair("house", "floors<=5:multi-floor")
         }
-        // 若僅為單一樓層 (例如 5樓, 2樓, 地下1樓, 5樓頂未登記) -> 公寓 (walk-up)
+        // 若僅為單一樓層 (例如 5樓, 2樓, B1, 5樓頂未登記) -> 公寓 (walk-up)
         return Pair("walk-up", "floors<=5:single-floor")
     }
 
