@@ -17,7 +17,8 @@ data class LandLocation(
     val landNumber: String,
     val rightScope: String = "",
     val landMinimalPrice: String = "",
-    val buildingNumbers: MutableList<String> = mutableListOf()
+    val buildingNumbers: MutableList<String> = mutableListOf(),
+    val shareSale: Boolean = false // 本筆是否只拍賣應有部分 (持分)，見 [shareSaleTargets]
 )
 
 // 定義建物結構
@@ -34,7 +35,8 @@ data class BuildingInfo(
     val commonArea: Boolean = false, // 共同使用部分 / 公設
     val floorAreaSqm: BigDecimal? = null, // 樓層面積合計 (平方公尺)
     val balconySqm: BigDecimal = BigDecimal.ZERO, // 附屬建物的陽台 (平方公尺)，未含在樓層面積合計時才另加
-    val areaSqm: BigDecimal? = null // 建物面積 = 樓層面積合計 + 陽台 (平方公尺)；共同使用部分的列為 null
+    val areaSqm: BigDecimal? = null, // 建物面積 = 樓層面積合計 + 陽台 (平方公尺)；共同使用部分的列為 null
+    val shareSale: Boolean = false // 本筆是否只拍賣應有部分 (持分)，見 [shareSaleTargets]
 )
 
 // 定義標別結構：一個標別是投標書上填一張的單位，底下有該標的土地、建物與金額
@@ -137,7 +139,8 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * the sentences they were decided from as `handoverEvidence`, `usage` (使用情形), `remarks` (備註),
  * `unnaturalDeath` (是否曾發生非自然死亡，即凶宅) with the sentence it was decided from as `unnaturalDeathEvidence` (or null),
  * `partitionSale` (分割變價拍賣：分割共有物或分割遺產的變價拍賣) with the sentence it was decided from as `partitionSaleEvidence` ("" when not),
- * `shareSale` (持分拍賣：僅拍賣所有權之應有部分) with the sentence it was decided from as `shareSaleEvidence` ("" when not),
+ * `shareSale` (持分拍賣：僅拍賣所有權之應有部分) with the sentence it was decided from as `shareSaleEvidence` ("" when not)
+ * — each land parcel and building unit also has its own `shareSale` for the rows that statement covers —
  * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
  * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台),
  * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
@@ -197,13 +200,13 @@ fun batchJson(batch: Batch): String {
     sb.append("\"landParcels\":[")
     sb.append(batch.landResults.mapIndexed { index, item ->
         "{\"diNumber\":${jsonString(item.landNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
-            "\"minimalPrice\":${priceToYuan(item.landMinimalPrice) ?: "null"},\"sortOrder\":$index}"
+            "\"minimalPrice\":${priceToYuan(item.landMinimalPrice) ?: "null"},\"sortOrder\":$index,\"shareSale\":${item.shareSale}}"
     }.joinToString(","))
     sb.append("],")
     sb.append("\"buildingUnits\":[")
     sb.append(batch.buildingResults.mapIndexed { index, item ->
         "{\"buNumber\":${jsonString(item.buildingNumber)},\"scope\":${jsonString(item.rightScope.ifBlank { null })}," +
-            "\"minimalPrice\":${priceToYuan(item.buildingMinimalPrice) ?: "null"},\"sortOrder\":$index," +
+            "\"minimalPrice\":${priceToYuan(item.buildingMinimalPrice) ?: "null"},\"sortOrder\":$index,\"shareSale\":${item.shareSale}," +
             "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}," +
             "\"floorAreaSqm\":${areaJson(item.floorAreaSqm)},\"floorAreaPing\":${areaJson(item.floorAreaSqm?.let { sqmToPing(it) })}," +
             "\"balconySqm\":${areaJson(item.balconySqm)},\"balconyPing\":${areaJson(sqmToPing(item.balconySqm))}," +
@@ -395,7 +398,9 @@ fun parseBatch(
     val handover = determineHandover(handoverField, usage + "\n" + remarks)
     val 分割變價拍賣依據 = findStatement(PARTITION_SALE, usage + "\n" + remarks)
         .ifBlank { findStatement(SUBJECT_PARTITION_SALE, subject) }
-    val 持分拍賣依據 = findStatement(SHARE_SALE, usage + "\n" + remarks)
+    val shareStatements = findShareSaleStatements(usage + "\n" + remarks)
+    val 持分拍賣依據 = shareStatements.firstOrNull()?.sentence ?: ""
+    val shareTargets = shareSaleTargets(shareStatements)
     return Batch(
         batchNumber = section.batchNumber,
         caseNumber = caseNumber,
@@ -415,8 +420,8 @@ fun parseBatch(
         持分拍賣 = 持分拍賣依據.isNotBlank(),
         持分拍賣依據 = 持分拍賣依據,
         remarks = remarks,
-        landResults = landResults,
-        buildingResults = buildingResults,
+        landResults = landResults.map { it.copy(shareSale = shareTargets.coversLand(it)) },
+        buildingResults = buildingResults.map { it.copy(shareSale = shareTargets.coversBuilding(it)) },
         warnings = computeBatchWarnings(landResults, buildingResults, deposit, minimalPriceTotal, owner) + handover.warnings +
             listOfNotNull(rebuttedUnnaturalDeath.ifBlank { null }?.let {
                 "有人稱曾發生非自然死亡，但死亡地點不在本件標的，判定為非凶宅 " +
@@ -589,6 +594,7 @@ fun renderReport(notice: Notice): String {
                 row("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
                 row("  📌 地號 Land Number:            " + (if (item.landNumber.isBlank()) "None" else item.landNumber + " 地號 (Land No. " + item.landNumber + ")"))
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+                if (item.shareSale) row("  🧩 持分 Share:                  是 Yes (僅拍賣應有部分)")
                 if (item.landMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
                 val bldgText = if (item.buildingNumbers.isNotEmpty()) {
                     item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
@@ -616,6 +622,7 @@ fun renderReport(notice: Notice): String {
                     row("     陽台 Balcony:              " + formatArea(item.balconySqm))
                 }
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
+                if (item.shareSale) row("  🧩 持分 Share:                  是 Yes (僅拍賣應有部分)")
                 if (item.buildingMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
             }
         }
@@ -1211,6 +1218,79 @@ val SHARE_SALE = Regex("""拍賣[^。；;，,]{0,15}(?:應有部分|持分)""")
  * 是執行分割遺產判決中的金錢給付，拍賣的是單一債務人的財產，不是變價分割。
  */
 val SUBJECT_PARTITION_SALE = Regex("""[（(]變價[）)]|強制執行法第131條""")
+
+/** 一句持分拍賣的說法：所在的句子與子句 (比對用，已去空白)。 */
+data class ShareSaleStatement(val sentence: String, val clause: String)
+
+/**
+ * 使用情形與備註中明確的持分拍賣說法，依出現順序。說法之前的子句要有「本件、僅、係、為」
+ * (「十、本件編號1建物即7899建號拍賣應有部分」「609-12地號土地僅拍賣債務人應有部分」)；
+ * 一般性的提醒 (「拍賣之應有部分，於核發權利移轉證書前，如有經分割共有物形成判決確定之情形者…」) 不算，
+ * 假設或詢問 (「如、若、是否」) 也不算。
+ */
+fun findShareSaleStatements(text: String): List<ShareSaleStatement> {
+    val joined = text.lines().joinToString("") { it.trim() }
+    val results = mutableListOf<ShareSaleStatement>()
+    for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
+        for (rawClause in sentence.split(Regex("""(?<=[，,])"""))) {
+            val clause = normalizeForMatch(rawClause)
+            val m = SHARE_SALE.find(clause) ?: continue
+            val before = clause.substring(0, m.range.first)
+            if (Regex("""如|若|是否""").containsMatchIn(before)) continue
+            if (!Regex("""本件|僅|係|為""").containsMatchIn(before)) continue
+            results.add(ShareSaleStatement(sentence.trim(), clause))
+        }
+    }
+    return results
+}
+
+/** 持分拍賣說法所涵蓋的列：指名的地號、建號，或整類 (全部土地、全部建物)。 */
+data class ShareSaleTargets(
+    val landNumbers: Set<String> = emptySet(),
+    val buildingNumbers: Set<String> = emptySet(),
+    val allLand: Boolean = false,
+    val allBuildings: Boolean = false
+) {
+    fun coversLand(land: LandLocation): Boolean =
+        !isWholeScope(land.rightScope) && (allLand || land.landNumber in landNumbers)
+
+    fun coversBuilding(building: BuildingInfo): Boolean =
+        !isWholeScope(building.rightScope) && (allBuildings || building.buildingNumber in buildingNumbers ||
+            buildingNumbers.any { isWrappedNumber(it, building.buildingNumber) })
+}
+
+/**
+ * 每句持分拍賣說法涵蓋哪些列：
+ * - 子句指名地號或建號的只涵蓋那幾筆 (「609-12地號土地僅拍賣債務人應有部分」「本件編號1建物即7899建號拍賣應有部分」)；
+ * - 否則依說法講的種類：建物、房屋、停車位 → 建物；土地、基地 → 土地；兩者都有
+ *   (「本件係拍賣建物及其基地之應有部分」「拍賣建物之應有部分及其基地應有部分」) → 兩者；
+ *   都沒有 (「本件係拍賣不動產之應有部分」「本件係拍賣應有部分」) → 全部。
+ * 權利範圍是全部 (「全部」「1分之1」) 的列本來就不是持分，不算 (見 [isWholeScope])。
+ */
+fun shareSaleTargets(statements: List<ShareSaleStatement>): ShareSaleTargets {
+    var targets = ShareSaleTargets()
+    for (st in statements) {
+        val named = Regex("""(\d+(?:-\d+)?)(地號|建號)""").findAll(st.clause).toList()
+        if (named.isNotEmpty()) {
+            targets = targets.copy(
+                landNumbers = targets.landNumbers + named.filter { it.groupValues[2] == "地號" }.map { it.groupValues[1] },
+                buildingNumbers = targets.buildingNumbers + named.filter { it.groupValues[2] == "建號" }.map { it.groupValues[1] }
+            )
+            continue
+        }
+        val building = Regex("""建物|房屋|車位""").containsMatchIn(st.clause)
+        val land = Regex("""土地|基地""").containsMatchIn(st.clause)
+        targets = targets.copy(
+            allLand = targets.allLand || land || !building,
+            allBuildings = targets.allBuildings || building || !land
+        )
+    }
+    return targets
+}
+
+/** 權利範圍是全部 (「全部」「1分之1」「公同共有1分之1」「1分之1(公同共有)」)，不是應有部分。 */
+fun isWholeScope(scope: String): Boolean =
+    scope.matches(Regex("""(?:公同共有)?(?:全部|1分之1)(?:[(（]公同共有[)）])?"""))
 
 /** 公告的依據 (「依據：強制執行法第131條第2項準用第81條。」)；找不到時為 ""。 */
 fun extractBasis(fullText: String): String =
