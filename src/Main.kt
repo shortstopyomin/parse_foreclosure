@@ -357,8 +357,10 @@ fun parseNotice(document: PDDocument): Notice {
     val openingPlace = extractOpeningPlace(sortedText)
 
     val subject = extractSubject(fullText) + "\n" + extractBasis(fullText)
-    val buildingCells = extractBuildingCells(document)
-    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject, buildingCells) }
+    val positioned = positionedLines(document)
+    val landCells = CellPool(extractLandCells(positioned))
+    val buildingCells = CellPool(extractBuildingCells(positioned))
+    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject, landCells, buildingCells) }
     val caseNumber = batches.map { it.caseNumber }.firstOrNull { it.isNotBlank() } ?: ""
     val owners = batches.map { it.owner }.filter { it.isNotBlank() }.distinct()
     return Notice(
@@ -372,13 +374,20 @@ fun parseNotice(document: PDDocument): Notice {
 }
 
 /** 解析一個標別段落；土地與建物只在同一標別內對應。`subject` 是公告的主旨與依據，用來判定分割變價拍賣。 */
-fun parseBatch(section: BatchSection, subject: String = "", buildingCells: List<BuildingCells> = emptyList()): Batch {
-    val landResults = parseLandLocations(section.text)
+fun parseBatch(
+    section: BatchSection,
+    subject: String = "",
+    landCells: CellPool<LandCells> = CellPool(emptyList()),
+    buildingCells: CellPool<BuildingCells> = CellPool(emptyList())
+): Batch {
+    val landResults = parseLandLocations(section.text, landCells)
     val buildingResults = parseBuildings(section.text, buildingCells)
     linkBuildingsToLand(landResults, buildingResults)
     val (caseNumber, owner) = extractCaseNumberAndOwner(section.text)
-    val deposit = extractDeposit(section.text)
-    val minimalPriceTotal = extractMinimalPriceTotal(section.text)
+    // 備註是內文，換行可能斷在數字中間 (「新台幣：38,59」接「0,000元」)，接起各行再找
+    val joinedText = section.text.lines().joinToString("") { it.trim() }
+    val deposit = extractDeposit(joinedText)
+    val minimalPriceTotal = extractMinimalPriceTotal(joinedText)
     val (unnaturalDeathEvidence, rebuttedUnnaturalDeath, uncertainUnnaturalDeath) = scanUnnaturalDeath(section.text)
     val usage = extractUsage(section.text)
     val remarks = extractRemarks(section.text)
@@ -1470,7 +1479,7 @@ fun joinWrappedLandNumber(landNo: String, nextLine: String?): String {
     return if (suffix.length + head.length == 4) landNo + head else landNo
 }
 
-fun parseLandLocations(attachmentText: String): List<LandLocation> {
+fun parseLandLocations(attachmentText: String, landCells: CellPool<LandCells> = CellPool(emptyList())): List<LandLocation> {
     val results = mutableListOf<LandLocation>()
     val lines = attachmentText.lines()
 
@@ -1530,24 +1539,28 @@ fun parseLandLocations(attachmentText: String): List<LandLocation> {
                         
                         val fullSection = section + "段"
 
+                        if (results.any { it.section == fullSection && it.landNumber == landNo }) continue
+
                         val windowText = (index..minOf(index + 15, lines.size - 1)).joinToString(" ") { lines[it] }
-                        val scope = extractSplitRightScope(lines, index).ifBlank { extractRightScope(windowText) }
-                        val price = extractMinimalPrice(windowText)
+                        // 依欄位位置取出的地號、權利範圍與價格 (拆行已接回) 優先，不完整時才用版面排序的文字
+                        val cells = landCells.take { it.landNumber == landNo || isWrappedNumber(landNo, it.landNumber) }
+                        val cellLandNo = cells?.landNumber?.takeIf { it.matches(Regex("""\d+(?:-\d+)?""")) }
+                        val scope = cells?.scope?.takeIf { isCompleteRightScope(it) }
+                            ?: extractSplitRightScope(lines, index).ifBlank { extractRightScope(windowText) }
+                        val price = cells?.price?.takeIf { isCompletePrice(it) } ?: extractMinimalPrice(windowText)
 
-                        val item = LandLocation(
-                            id = (results.size + 1).toString(),
-                            county = county,
-                            district = district,
-                            section = fullSection,
-                            subSection = subSection,
-                            landNumber = landNo,
-                            rightScope = scope,
-                            landMinimalPrice = price
+                        results.add(
+                            LandLocation(
+                                id = (results.size + 1).toString(),
+                                county = county,
+                                district = district,
+                                section = fullSection,
+                                subSection = subSection,
+                                landNumber = cellLandNo ?: landNo,
+                                rightScope = scope,
+                                landMinimalPrice = price
+                            )
                         )
-
-                        if (results.none { it.section == item.section && it.landNumber == item.landNumber }) {
-                            results.add(item)
-                        }
                     }
                 }
             }
@@ -1589,8 +1602,75 @@ data class BuildingCells(
     val floorArea: String,
     val annex: String,
     val location: String = "",
-    val structure: String = ""
+    val structure: String = "",
+    val scope: String = "",
+    val price: String = ""
 )
+
+/** 依欄位位置取出的一列土地：地號、權利範圍與最低拍賣價格欄的文字，欄內拆行已接回。 */
+data class LandCells(val landNumber: String, val scope: String, val price: String)
+
+/**
+ * 依文字的 x 座標取出土地表格各列的地號、權利範圍與最低拍賣價格 (同 [extractBuildingCells] 的做法)。
+ * 欄寬不夠時數字會拆到下一行：地號「1835-00」接「01」、權利範圍「329616000」接「0分之6022」接「562」。
+ * 表頭第二行「號 縣 市 鄉鎮市區 段 小段 地號 … 平方公尺 範 圍 (新臺幣元)」的 x 座標就是各欄的左緣；
+ * 價格之後若還有一欄 (「保證金額 (新臺幣元)」)，價格欄到那一欄為止。
+ */
+fun extractLandCells(lines: List<List<Glyph>>): List<LandCells> {
+    class Columns(val county: Float, val landNo: Float, val afterLandNo: Float, val scope: Float, val price: Float, val afterPrice: Float)
+    class Row { val no = StringBuilder(); val scope = StringBuilder(); val price = StringBuilder() }
+    var columns: Columns? = null
+    val results = mutableListOf<LandCells>()
+    var row: Row? = null
+    var inRemark = false
+    fun finishRow() {
+        row?.let { if (it.no.isNotEmpty()) results.add(LandCells(it.no.toString(), it.scope.toString(), it.price.toString())) }
+        row = null
+    }
+    for ((index, line) in lines.withIndex()) {
+        val t = lineText(line)
+        if (t.contains("鄉鎮市區") && t.contains("地號")) {
+            finishRow()
+            val header = lines.subList(maxOf(0, index - 2), minOf(lines.size, index + 3)).filter { l -> lineText(l).none { it.isDigit() } }
+            val county = xOfWord(line, "縣")
+            val landNo = xOfWord(line, "地號")
+            // 地號右邊的下一欄：使用地類別或面積
+            val afterLandNo = header.mapNotNull { h -> listOf("地類別", "使", "平方公尺", "面").mapNotNull { xOfWord(h, it) }.filter { landNo != null && it > landNo + 5 }.minOrNull() }.minOrNull()
+            val scope = header.firstNotNullOfOrNull { xOfWord(it, "範") }
+            val prices = header.flatMap { h -> Regex("""[(（]新臺幣元[)）]""").findAll(lineText(h)).map { h[it.range.first].x }.toList() }.distinct().sorted()
+            val price = prices.firstOrNull { scope != null && it > scope }
+            val afterPrice = header.firstNotNullOfOrNull { xOfWord(it, "保證金") }
+                ?: prices.firstOrNull { price != null && it > price + 5 } ?: Float.MAX_VALUE
+            columns = if (county != null && landNo != null && afterLandNo != null && scope != null && price != null) {
+                Columns(county, landNo, afterLandNo, scope, price, afterPrice)
+            } else null
+            continue
+        }
+        val c = columns ?: continue
+        if (PAGE_MARK_LINE.matches(t)) continue
+        if (Regex("""點交|使用情形|建號|附屬建物|標別|財產所有人""").containsMatchIn(t)) { finishRow(); columns = null; continue }
+        val first = line.first()
+        // 編號欄 (縣市欄左邊) 有數字：新的一列
+        if (first.x < c.county - 5 && first.text.first().isDigit()) { finishRow(); row = Row(); inRemark = false }
+        if (xOfWord(line, "備考")?.let { it < c.landNo } == true) inRemark = true
+        val current = row ?: continue
+        if (inRemark) continue
+        current.no.append(cellText(line, c.landNo, c.afterLandNo))
+        current.scope.append(cellText(line, c.scope, c.price))
+        current.price.append(cellText(line, c.price, c.afterPrice))
+    }
+    finishRow()
+    return results
+}
+
+/** 依文件順序取用的欄位結果：同一地號或建號可能出現在不同標別 (權利範圍不同)，每列只能用一次。 */
+class CellPool<T>(items: List<T>) {
+    private val remaining = items.toMutableList()
+    fun take(predicate: (T) -> Boolean): T? = remaining.firstOrNull(predicate)?.also { remaining.remove(it) }
+}
+
+/** 欄位裡的價格要是完整的「1,920,000元」才用。 */
+fun isCompletePrice(price: String): Boolean = price.matches(Regex("""(?:\d{1,3}(?:,\d{3})+|\d+)元"""))
 
 /**
  * 依文字的 x 座標取出建物表格各列的建號、樓層面積與附屬建物欄。
@@ -1599,8 +1679,13 @@ data class BuildingCells(
  * 表頭「建號」「樓 層 面 積」「附屬建物主」「權利範圍」的 x 座標就是各欄的左緣 (資料靠左對齊)，
  * 每列從編號欄有數字的那一行起，到「備考」為止，各欄逐行的片段依 [joinCellLines] 接起來。
  */
-fun extractBuildingCells(document: PDDocument): List<BuildingCells> {
-    data class Glyph(val page: Int, val x: Float, val y: Float, val text: String)
+fun extractBuildingCells(document: PDDocument): List<BuildingCells> = extractBuildingCells(positionedLines(document))
+
+/** PDF 上的一個字與它的位置。 */
+data class Glyph(val page: Int, val x: Float, val y: Float, val text: String)
+
+/** 全文依頁、行 (同一頁 y 相差 3 以內) 分組的字，行內依 x 排序；左邊界行號不算。 */
+fun positionedLines(document: PDDocument): List<List<Glyph>> {
     val glyphs = mutableListOf<Glyph>()
     val stripper = object : PDFTextStripper() {
         override fun writeString(text: String, textPositions: List<TextPosition>) {
@@ -1625,19 +1710,39 @@ fun extractBuildingCells(document: PDDocument): List<BuildingCells> {
         }
         if (current.isNotEmpty()) lines.add(current.sortedBy { it.x })
     }
-    fun text(line: List<Glyph>) = line.joinToString("") { it.text }
-    fun xOf(line: List<Glyph>, word: String): Float? {
-        val i = text(line).indexOf(word)
-        return if (i < 0) null else line[i].x
-    }
+    return lines
+}
 
-    class Columns(val bldgNo: Float, val base: Float, val structure: Float, val floor: Float, val annex: Float, val scope: Float)
+fun lineText(line: List<Glyph>) = line.joinToString("") { it.text }
+
+/** `word` 在這一行 (從第 `from` 個字起) 第一次出現的 x 座標。 */
+fun xOfWord(line: List<Glyph>, word: String, from: Int = 0): Float? {
+    val i = lineText(line).indexOf(word, from)
+    return if (i < 0) null else line[i].x
+}
+
+/** 欄的文字：x 在 [from, to) 之間的字 (左緣容許 3 的誤差)。 */
+fun cellText(line: List<Glyph>, from: Float, to: Float) = line.filter { it.x >= from - 3 && it.x < to - 3 }.joinToString("") { it.text }
+
+/** 頁碼與「(續上頁)」：不屬於表格的任何一欄。 */
+val PAGE_MARK_LINE = Regex("""^(?:第[一二三四五六七八九十\d]{1,4}頁|[(（]續上頁[)）])$""")
+
+fun extractBuildingCells(lines: List<List<Glyph>>): List<BuildingCells> {
+    fun text(line: List<Glyph>) = lineText(line)
+    fun xOf(line: List<Glyph>, word: String) = xOfWord(line, word)
+
+    class Columns(
+        val bldgNo: Float, val base: Float, val structure: Float, val floor: Float, val annex: Float, val scope: Float, val price: Float,
+        val afterPrice: Float
+    )
     class Row {
         val no = StringBuilder()
         val location = mutableListOf<String>()
         val structure = mutableListOf<String>()
         val floor = mutableListOf<String>()
         val annex = mutableListOf<String>()
+        val scope = StringBuilder()
+        val price = StringBuilder()
     }
     var columns: Columns? = null
     val results = mutableListOf<BuildingCells>()
@@ -1648,13 +1753,14 @@ fun extractBuildingCells(document: PDDocument): List<BuildingCells> {
             if (it.no.isNotEmpty()) results.add(
                 BuildingCells(
                     it.no.toString(), joinCellLines(it.floor), joinCellLines(it.annex),
-                    location = it.location.joinToString(""), structure = it.structure.joinToString("")
+                    location = it.location.joinToString(""), structure = it.structure.joinToString(""),
+                    scope = it.scope.toString(), price = it.price.toString()
                 )
             )
         }
         row = null
     }
-    fun cell(line: List<Glyph>, from: Float, to: Float) = line.filter { it.x >= from - 3 && it.x < to - 3 }.joinToString("") { it.text }
+    fun cell(line: List<Glyph>, from: Float, to: Float) = cellText(line, from, to)
     for ((index, line) in lines.withIndex()) {
         val t = text(line)
         if (t.contains("附屬建物主")) {
@@ -1668,14 +1774,17 @@ fun extractBuildingCells(document: PDDocument): List<BuildingCells> {
             val scope = header.firstNotNullOfOrNull { xOf(it, "權利範圍") }
             val base = header.firstNotNullOfOrNull { xOf(it, "--------------") ?: xOf(it, "基") }
             val structure = header.firstNotNullOfOrNull { xOf(it, "建築式") ?: xOf(it, "樣主要") }
-            columns = if (bldgNo != null && floor != null && scope != null && base != null && structure != null) {
-                Columns(bldgNo, base, structure, floor, annex, scope)
+            val price = header.firstNotNullOfOrNull { xOf(it, "最低拍賣價格") }
+            // 價格之後若還有一欄 (清水的「保證金額」)，價格欄到那一欄為止
+            val afterPrice = header.firstNotNullOfOrNull { xOf(it, "保證金") } ?: Float.MAX_VALUE
+            columns = if (bldgNo != null && floor != null && scope != null && base != null && structure != null && price != null) {
+                Columns(bldgNo, base, structure, floor, annex, scope, price, afterPrice)
             } else null
             continue
         }
         val c = columns ?: continue
         // 頁碼與「(續上頁)」不屬於任何一欄
-        if (Regex("""^(?:第[一二三四五六七八九十\d]{1,4}頁|[(（]續上頁[)）])$""").matches(t)) continue
+        if (PAGE_MARK_LINE.matches(t)) continue
         if (Regex("""點交|使用情形|土[\s\u3000]*地[\s\u3000]*坐|標別""").containsMatchIn(t)) { finishRow(); columns = null; continue }
         val first = line.first()
         // 編號欄 (建號欄左邊) 有數字：新的一列
@@ -1688,17 +1797,19 @@ fun extractBuildingCells(document: PDDocument): List<BuildingCells> {
         cell(line, c.structure, c.floor).takeIf { it.isNotEmpty() }?.let { current.structure.add(it) }
         cell(line, c.floor, c.annex).takeIf { it.isNotEmpty() }?.let { current.floor.add(it) }
         cell(line, c.annex, c.scope - 3).takeIf { it.isNotEmpty() }?.let { current.annex.add(it) }
+        current.scope.append(cell(line, c.scope - 3, c.price))
+        current.price.append(cell(line, c.price, c.afterPrice))
     }
     finishRow()
     return results
 }
 
 /**
- * 建號欄寬不夠時，5 位數的建號會拆成兩行 (「1527」接「2」→ 15272)，依版面排序的文字只看得到第一行。
- * 依欄位位置取出的建號 `fromCells` 是 `fromText` 再接上數字時，就是同一個建號被截斷了。
+ * 地號或建號欄寬不夠時，數字會拆成兩行 (建號「1527」接「2」→ 15272、地號「1835-00」接「01」→ 1835-0001)，
+ * 依版面排序的文字只看得到第一行。依欄位位置取出的 `fromCells` 是 `fromText` 再接上數字時，就是同一個號碼被截斷了。
  */
-fun isWrappedBuildingNumber(fromText: String, fromCells: String): Boolean =
-    fromCells.length > fromText.length && fromCells.startsWith(fromText) && fromCells.drop(fromText.length).all { it.isDigit() }
+fun isWrappedNumber(fromText: String, fromCells: String): Boolean =
+    fromCells.length > fromText.length && fromCells.startsWith(fromText) && fromCells.drop(fromText.length).all { it.isDigit() || it == '-' }
 
 /**
  * 把欄內逐行的片段接成一段：以數字或小數點開頭、又沒有「:」的片段是上一行被截斷的後半，直接接上
@@ -1736,7 +1847,7 @@ fun extractBaseLocation(rowRest: String, followingLines: List<String>): String {
  */
 val TEMP_BUILDING_ROW = Regex("""^(?:(?<itemNo>\d+)\s+)?暫\s*編\s*(?:(?<num>\d{1,5})(?:\s|$))?\s*(?<rest>.*)$""")
 
-fun parseBuildings(attachmentText: String, buildingCells: List<BuildingCells> = emptyList()): List<BuildingInfo> {
+fun parseBuildings(attachmentText: String, buildingCells: CellPool<BuildingCells> = CellPool(emptyList())): List<BuildingInfo> {
     val results = mutableListOf<BuildingInfo>()
     val lines = attachmentText.lines()
 
@@ -1798,13 +1909,13 @@ fun parseBuildings(attachmentText: String, buildingCells: List<BuildingCells> = 
         }
         val rest = extractBaseLocation(firstMatch?.groups["rest"]?.value ?: "", continuation)
 
-        val scope = extractSplitRightScope(lines, start).ifBlank { extractRightScope(blockText) }
-        val price = extractMinimalPrice(blockText)
         // 備考常寫「含共同使用部分1772建號」，只看備考之前的建物列本身
         val rowText = blockLines.takeWhile { !it.trim().startsWith("備考") }.joinToString("\n")
         // 依欄位位置取出的各欄 (拆行已接回) 優先，否則用混在一起的列文字
-        val cells = buildingCells.firstOrNull { it.buildingNumber == bldgNo }
-            ?: buildingCells.firstOrNull { isWrappedBuildingNumber(bldgNo, it.buildingNumber) }
+        val cells = buildingCells.take { it.buildingNumber == bldgNo || isWrappedNumber(bldgNo, it.buildingNumber) }
+        val scope = cells?.scope?.takeIf { isCompleteRightScope(it) }
+            ?: extractSplitRightScope(lines, start).ifBlank { extractRightScope(blockText) }
+        val price = cells?.price?.takeIf { isCompletePrice(it) } ?: extractMinimalPrice(blockText)
         // 房屋層數在建築式樣欄 (「住家用，鋼筋混凝土造三層」)，所在樓層在樓層面積欄 (「7層:」) 或門牌 (「43號7樓」)
         val (floors, located) = extractFloorInfo(cells?.let { listOf(it.structure, it.floorArea, it.location).joinToString("\n") } ?: rowText)
         val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
