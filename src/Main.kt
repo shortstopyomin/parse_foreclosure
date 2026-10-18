@@ -102,6 +102,7 @@ data class Notice(
     val owner: String,             // 各標別財產所有人皆相同時為該人，否則為 ""
     val biddingDateTime: String,
     val openingPlace: String,      // 開標地點
+    val section: String,           // 股別 (例如 "仁"，即「仁股」)；找不到為 ""
     val batches: List<Batch>,
     val warnings: List<String>     // 整份公告層級的警示 (各標別的警示在 Batch.warnings)
 )
@@ -126,7 +127,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
 
 /**
  * Emit the stable machine-readable contract for one PDF, layered like the notice itself:
- * the PDF-level fields (`caseNumber`, `owner`, `biddingDateTime`, `openingPlace`, `warnings`)
+ * the PDF-level fields (`caseNumber`, `owner`, `biddingDateTime`, `openingPlace`, `section` (股別, e.g. "仁"), `warnings`)
  * and `batches`, one per 標別 — the unit a bid form is filled in for. `batchNumber` is null
  * when the PDF has no 標別 label (a single-batch notice).
  *
@@ -159,6 +160,7 @@ fun printJson(notice: Notice, report: String) {
     sb.append("\"owner\":${jsonString(notice.owner.ifBlank { null })},")
     sb.append("\"biddingDateTime\":${jsonString(notice.biddingDateTime.ifBlank { null })},")
     sb.append("\"openingPlace\":${jsonString(notice.openingPlace.ifBlank { null })},")
+    sb.append("\"section\":${jsonString(notice.section.ifBlank { null })},")
     sb.append("\"batches\":[")
     sb.append(notice.batches.joinToString(",") { batchJson(it) })
     sb.append("],")
@@ -371,6 +373,7 @@ fun parseNotice(document: PDDocument): Notice {
         owner = owners.singleOrNull() ?: "",
         biddingDateTime = biddingDateTime,
         openingPlace = openingPlace,
+        section = extractSection(sortedText),
         batches = batches,
         warnings = computeNoticeWarnings(sortedText, biddingDateTime, openingPlace, batches)
     )
@@ -529,6 +532,7 @@ fun renderReport(notice: Notice): String {
     if (notice.owner.isNotBlank()) line("   👤 財產所有人 Owner: " + notice.owner)
     if (notice.biddingDateTime.isNotBlank()) line("   ⏰ 投標日時間 Bidding Date & Time: " + notice.biddingDateTime)
     if (notice.openingPlace.isNotBlank()) line("   📍 開標地點 Opening Place: " + notice.openingPlace)
+    if (notice.section.isNotBlank()) line("   🗂️ 股別: \"${notice.section}\" 股")
     line("   📦 共 ${notice.batches.size} 個標別 (${notice.batches.size} batch${if (notice.batches.size == 1) "" else "es"})")
     line(separator)
 
@@ -1378,6 +1382,12 @@ fun extractOpeningPlace(text: String): String {
     val place = extractRawOpeningPlace(text)
     val court = extractCourtName(text)
     return if (court.isBlank()) place else place.replace("本院", court)
+}
+
+/** 公告結尾承辦資訊的股別 (如：「股　　別：仁股」→ "仁")；找不到為 ""。股與別之間常以不換行空白 (U+00A0) 隔開。 */
+fun extractSection(text: String): String {
+    val compact = text.replace(Regex("""[\s\u00A0\u3000]+"""), "")
+    return Regex("""股別[:：](?<name>[^股:：]{1,3})股""").find(compact)?.groups?.get("name")?.value ?: ""
 }
 
 fun extractRawOpeningPlace(text: String): String {
