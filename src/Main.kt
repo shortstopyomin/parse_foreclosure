@@ -33,12 +33,34 @@ data class BuildingInfo(
     val buildingType: String = "", // "house", "elevator", "walk-up"
     val buildingTypeRule: String = "", // which rule of determineBuildingType decided buildingType
     val commonArea: Boolean = false, // 共同使用部分 / 公設
-    val floorAreaSqm: BigDecimal? = null, // 樓層面積合計 (平方公尺)
-    val balconySqm: BigDecimal = BigDecimal.ZERO, // 附屬建物的陽台與平台 (平方公尺)，未含在樓層面積合計時才另加
-    val areaSqm: BigDecimal? = null, // 建物面積 = 樓層面積合計 + 陽台/平台 (平方公尺)；共同使用部分的列為 null
+    val floorAreaSqm: BigDecimal? = null, // 樓層面積合計 (平方公尺，整筆建物)
+    val balconySqm: BigDecimal = BigDecimal.ZERO, // 附屬建物的陽台與平台 (平方公尺，整筆建物)，未含在樓層面積合計時才另加
+    val scopeRatio: BigDecimal? = null, // 權利範圍換算的比例 (全部 = 1，10000分之467 = 0.0467)；無法換算時為 null
+    val areaSqm: BigDecimal? = null, // 建物面積 = (樓層面積合計 + 陽台/平台) × 權利範圍 (平方公尺，實際持有)；共同使用部分的列為 null
     val unregistered: Boolean = false, // 未登記建物 (「第一層未登記部分」「未登記建物查封」)：不算進標別的建物面積
     val shareSale: Boolean = false // 本筆是否只拍賣應有部分 (持分)，見 [shareSaleTargets]
-)
+) {
+    /** 整筆建物的面積 (樓層面積合計 + 陽台/平台)；共同使用部分或沒有樓層面積時為 null。 */
+    val wholeAreaSqm: BigDecimal?
+        get() = if (areaSqm == null) null else floorAreaSqm?.add(balconySqm)
+
+    /** 依權利範圍換算成實際持有的面積；權利範圍無法換算時以整筆計。 */
+    fun owned(sqm: BigDecimal): BigDecimal = sqm.multiply(scopeRatio ?: BigDecimal.ONE)
+}
+
+/**
+ * 權利範圍換算成比例：「全部」→ 1、「10000分之467」→ 0.0467、「1/2」→ 0.5，「公同共有」與括號不影響；
+ * 無法換算 (欄位不完整) 時為 null。
+ */
+fun scopeRatio(scope: String): BigDecimal? {
+    val s = scope.replace(Regex("""公同共有|[()（）\s]"""), "")
+    if (s == "全部") return BigDecimal.ONE
+    val (numerator, denominator) = Regex("""^(\d+)分之(\d+)$""").matchEntire(s)?.let { it.groupValues[2] to it.groupValues[1] }
+        ?: Regex("""^(\d+)/(\d+)$""").matchEntire(s)?.let { it.groupValues[1] to it.groupValues[2] }
+        ?: return null
+    val d = denominator.toBigDecimal().takeIf { it.signum() > 0 } ?: return null
+    return numerator.toBigDecimal().divide(d, 10, RoundingMode.HALF_UP)
+}
 
 // 定義標別結構：一個標別是投標書上填一張的單位，底下有該標的土地、建物與金額
 data class Batch(
@@ -78,17 +100,17 @@ data class Batch(
             rows.filter { !it.unregistered }.ifEmpty { rows }
         }
 
-    /** 本標別建物面積 (平方公尺)：各建物的建物面積加總；沒有任何建物面積時為 null。 */
+    /** 本標別建物面積 (平方公尺)：各建物依權利範圍換算後的建物面積加總；沒有任何建物面積時為 null。 */
     val buildingAreaSqm: BigDecimal?
         get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.areaSqm) }
 
-    /** 本標別樓層面積合計 (平方公尺)：建物面積中樓層面積的部分；沒有任何建物面積時為 null。 */
+    /** 本標別樓層面積合計 (平方公尺)：建物面積中樓層面積的部分 (依權利範圍換算)；沒有任何建物面積時為 null。 */
     val floorAreaSqm: BigDecimal?
-        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.floorAreaSqm) }
+        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.owned(b.floorAreaSqm!!)) }
 
-    /** 本標別陽台/平台面積 (平方公尺)：建物面積中另加的陽台與平台部分；沒有任何建物面積時為 null。 */
+    /** 本標別陽台/平台面積 (平方公尺)：建物面積中另加的陽台與平台部分 (依權利範圍換算)；沒有任何建物面積時為 null。 */
     val balconySqm: BigDecimal?
-        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.balconySqm) }
+        get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.owned(b.balconySqm)) }
 
     /**
      * 每坪單價 (元/坪)：拍賣最低價額合計 ÷ 建物面積 (坪，取顯示的小數 2 位)，四捨五入到小數 1 位；
@@ -149,7 +171,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * `shareSale` (持分拍賣：僅拍賣所有權之應有部分) with the sentence it was decided from as `shareSaleEvidence` ("" when not)
  * — each land parcel and building unit also has its own `shareSale` for the rows that statement covers —
  * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
- * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台與平台) — 未登記建物不算，除非標別內全是未登記建物 —
+ * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台與平台) — 依權利範圍換算成實際持有的面積；未登記建物不算，除非標別內全是未登記建物 —
  * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
  * two independent arrays (land parcels, building units) with no field linking one to the other —
  * the in-memory building-to-land cross-join (used only for the human-readable display) is
@@ -218,6 +240,7 @@ fun batchJson(batch: Batch): String {
             "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}," +
             "\"floorAreaSqm\":${areaJson(item.floorAreaSqm)},\"floorAreaPing\":${areaJson(item.floorAreaSqm?.let { sqmToPing(it) })}," +
             "\"balconySqm\":${areaJson(item.balconySqm)},\"balconyPing\":${areaJson(sqmToPing(item.balconySqm))}," +
+            "\"wholeAreaSqm\":${areaJson(item.wholeAreaSqm)},\"wholeAreaPing\":${areaJson(item.wholeAreaSqm?.let { sqmToPing(it) })}," +
             "\"areaSqm\":${areaJson(item.areaSqm)},\"areaPing\":${areaJson(item.areaSqm?.let { sqmToPing(it) })},\"unregistered\":${item.unregistered}}"
     }.joinToString(","))
     sb.append("],")
@@ -299,6 +322,9 @@ fun computeBatchWarnings(
     val areaRows = buildingResults.filter { it.areaSqm != null }
     if (areaRows.isNotEmpty() && areaRows.all { it.unregistered }) {
         warnings.add("本標別建物全是未登記建物，建物面積以未登記建物計 (Every building is unregistered; the batch area uses them)")
+    }
+    for (b in buildingResults.filter { it.areaSqm != null && it.scopeRatio == null }) {
+        warnings.add("${b.buildingNumber}建號權利範圍無法換算，建物面積以整筆計 (Could not convert the ownership scope of building ${b.buildingNumber}; used the whole area)")
     }
     for (b in buildingResults.filter { it.floorAreaSqm == null }) {
         warnings.add("${b.buildingNumber}建號未解析到樓層面積合計 (No floor area total found for building ${b.buildingNumber})")
@@ -394,15 +420,16 @@ fun parseNotice(document: PDDocument): Notice {
 }
 
 /** 使用情形、備註說是未登記建物的句子。 */
-val UNREGISTERED_STATEMENT = Regex("""未登記建物|未辦理建築物所有權第一次登記""")
+val UNREGISTERED_STATEMENT = Regex("""未登記建物|未辦(?:理)?(?:建築物|建物)所有權第一次登記|未辦(?:理)?保存登記""")
 
 /**
  * 使用情形、備註說是未登記建物的建號：句子的主詞，也就是句中第一組建號。
  * 「264建號、265建號係未登記建物」→ {264, 265}；「拍賣之7364及7367建號建物為6554建號建物之增建，因未辦理建築物所有權
- * 第一次登記」→ {7364, 7367} (6554 是被增建的主建物，不算)；「暫編第2500建號之建物，係第556建號主建物之增建部分，未辦理…」→ {2500}。
+ * 第一次登記」→ {7364, 7367} (6554 是被增建的主建物，不算)；「暫編第2500建號之建物，係第556建號主建物之增建部分，未辦理…」→ {2500}；
+ * 「第3200號建物係未辦保存登記建物」→ {3200}。
  */
 fun unregisteredBuildingNumbers(text: String): Set<String> {
-    val numbers = Regex("""第?\d+(?:建號)?(?:[、及和與]第?\d+(?:建號)?)*建號""")
+    val numbers = Regex("""第?\d+(?:建號|號)?(?:[、及和與]第?\d+(?:建號|號)?)*(?:建號|號建物)""")
     return text.replace(Regex("""\s"""), "").split(Regex("""[。；]""")).flatMap { sentence ->
         val at = UNREGISTERED_STATEMENT.find(sentence)?.range?.first ?: return@flatMap emptyList()
         val subject = numbers.find(sentence.substring(0, at)) ?: return@flatMap emptyList()
@@ -656,8 +683,11 @@ fun renderReport(notice: Notice): String {
                 if (item.locatedFloor.isNotBlank()) row("  🚪 所在樓層 Located Floor:     " + formatLocatedFloor(item.locatedFloor))
                 if (item.areaSqm != null) {
                     row("  📐 建物面積 Building Area:     " + formatArea(item.areaSqm))
-                    row("     樓層面積合計 Floor Area:    " + formatArea(item.floorAreaSqm!!))
-                    row("     陽台/平台 Balcony/Platform: " + formatArea(item.balconySqm))
+                    if (item.scopeRatio != null && item.scopeRatio.compareTo(BigDecimal.ONE) != 0) {
+                        row("     = 整筆 Whole " + formatArea(item.wholeAreaSqm!!) + " × 權利範圍 " + item.rightScope)
+                    }
+                    row("     樓層面積合計 (整筆) Floor Area:    " + formatArea(item.floorAreaSqm!!))
+                    row("     陽台/平台 (整筆) Balcony/Platform: " + formatArea(item.balconySqm))
                     if (item.unregistered) row("     ⚠️ 未登記建物，不算進標別建物面積 Unregistered; not in the batch area")
                 }
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
@@ -2068,7 +2098,8 @@ fun parseBuildings(attachmentText: String, buildingCells: CellPool<BuildingCells
             val m = bldgRowRegex.find(trimmed)
             if (m != null) {
                 val bldgNo = m.groups["bldgNo"]?.value ?: ""
-                if (bldgNo.length in 2..5) {
+                // 建號不會以 0 開頭；「0002 、 0506-000」是基地坐落裡被拆行的地號 (0506-0002、0506-0003)，不是建物列
+                if (bldgNo.length in 2..5 && !bldgNo.startsWith("0") && !m.groups["rest"]!!.value.startsWith("、")) {
                     bldgIndices.add(Pair(i, bldgNo))
                 }
             }
@@ -2103,10 +2134,10 @@ fun parseBuildings(attachmentText: String, buildingCells: CellPool<BuildingCells
         val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
         // 共同使用部分的合計是整棟公設面積，不算建物面積
         val isCommonAreaRow = rowText.contains("共同使用部分") || rowText.contains("公設")
-        // 未登記建物：建物列寫「第一層未登記部分」「…號未登記」，或備考寫「未登記建物查封」
+        // 未登記建物：建物列寫「第一層未登記部分」「…號未登記」，或備考寫「未登記建物查封」「未辦保存登記建物」
         // (「…之未登」接「記部分」會斷行，比對前先去掉空白)
         val isUnregistered = rowText.replace(Regex("""\s"""), "").contains("未登記") ||
-            blockText.substringAfter("備考", "").replace(Regex("""\s"""), "").contains("未登記建物")
+            UNREGISTERED_STATEMENT.containsMatchIn(blockText.substringAfter("備考", "").replace(Regex("""\s"""), ""))
         val (floorArea, balcony) = extractBuildingArea(cells?.let { it.floorArea + "\n" + it.annex } ?: rowText)
         if (firstMainType == null && !isCommonAreaRow) {
             firstMainType = bType
@@ -2125,7 +2156,8 @@ fun parseBuildings(attachmentText: String, buildingCells: CellPool<BuildingCells
             commonArea = isCommonAreaRow,
             floorAreaSqm = floorArea,
             balconySqm = balcony,
-            areaSqm = if (isCommonAreaRow) null else floorArea?.add(balcony),
+            scopeRatio = scopeRatio(scope),
+            areaSqm = if (isCommonAreaRow) null else floorArea?.add(balcony)?.multiply(scopeRatio(scope) ?: BigDecimal.ONE),
             unregistered = isUnregistered
         )
         if (results.none { it.buildingNumber == item.buildingNumber }) {
