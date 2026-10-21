@@ -34,8 +34,9 @@ data class BuildingInfo(
     val buildingTypeRule: String = "", // which rule of determineBuildingType decided buildingType
     val commonArea: Boolean = false, // 共同使用部分 / 公設
     val floorAreaSqm: BigDecimal? = null, // 樓層面積合計 (平方公尺)
-    val balconySqm: BigDecimal = BigDecimal.ZERO, // 附屬建物的陽台 (平方公尺)，未含在樓層面積合計時才另加
-    val areaSqm: BigDecimal? = null, // 建物面積 = 樓層面積合計 + 陽台 (平方公尺)；共同使用部分的列為 null
+    val balconySqm: BigDecimal = BigDecimal.ZERO, // 附屬建物的陽台與平台 (平方公尺)，未含在樓層面積合計時才另加
+    val areaSqm: BigDecimal? = null, // 建物面積 = 樓層面積合計 + 陽台/平台 (平方公尺)；共同使用部分的列為 null
+    val unregistered: Boolean = false, // 未登記建物 (「第一層未登記部分」「未登記建物查封」)：不算進標別的建物面積
     val shareSale: Boolean = false // 本筆是否只拍賣應有部分 (持分)，見 [shareSaleTargets]
 )
 
@@ -68,9 +69,14 @@ data class Batch(
         get() = landResults.sumOf { priceToYuan(it.landMinimalPrice) ?: 0L } +
             buildingResults.sumOf { priceToYuan(it.buildingMinimalPrice) ?: 0L }
 
-    /** 有建物面積的建物 (共同使用部分不計)。 */
+    /**
+     * 算進標別建物面積的建物：共同使用部分不計，未登記建物也不計；
+     * 但標別內的建物全是未登記時 (只拍賣未登記建物)，就以未登記建物的面積計。
+     */
     private val areaBuildings: List<BuildingInfo>
-        get() = buildingResults.filter { it.areaSqm != null }
+        get() = buildingResults.filter { it.areaSqm != null }.let { rows ->
+            rows.filter { !it.unregistered }.ifEmpty { rows }
+        }
 
     /** 本標別建物面積 (平方公尺)：各建物的建物面積加總；沒有任何建物面積時為 null。 */
     val buildingAreaSqm: BigDecimal?
@@ -80,7 +86,7 @@ data class Batch(
     val floorAreaSqm: BigDecimal?
         get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.floorAreaSqm) }
 
-    /** 本標別陽台面積 (平方公尺)：建物面積中另加的陽台部分；沒有任何建物面積時為 null。 */
+    /** 本標別陽台/平台面積 (平方公尺)：建物面積中另加的陽台與平台部分；沒有任何建物面積時為 null。 */
     val balconySqm: BigDecimal?
         get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.balconySqm) }
 
@@ -143,7 +149,7 @@ fun jsonString(s: String?): String = if (s == null) "null" else "\"${jsonEscape(
  * `shareSale` (持分拍賣：僅拍賣所有權之應有部分) with the sentence it was decided from as `shareSaleEvidence` ("" when not)
  * — each land parcel and building unit also has its own `shareSale` for the rows that statement covers —
  * `buildingAreaSqm` / `buildingAreaPing` (建物面積 in 平方公尺 / 坪, or null) and its parts
- * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台),
+ * `floorAreaSqm` / `floorAreaPing` (樓層面積合計) and `balconySqm` / `balconyPing` (陽台與平台) — 未登記建物不算，除非標別內全是未登記建物 —
  * `pricePerPing` (每坪單價 = minimalPriceTotal ÷ buildingAreaPing in 元, 1 decimal, or null), its own `warnings`, and
  * two independent arrays (land parcels, building units) with no field linking one to the other —
  * the in-memory building-to-land cross-join (used only for the human-readable display) is
@@ -212,7 +218,7 @@ fun batchJson(batch: Batch): String {
             "${floorAndTypeJson(item)},\"commonArea\":${item.commonArea}," +
             "\"floorAreaSqm\":${areaJson(item.floorAreaSqm)},\"floorAreaPing\":${areaJson(item.floorAreaSqm?.let { sqmToPing(it) })}," +
             "\"balconySqm\":${areaJson(item.balconySqm)},\"balconyPing\":${areaJson(sqmToPing(item.balconySqm))}," +
-            "\"areaSqm\":${areaJson(item.areaSqm)},\"areaPing\":${areaJson(item.areaSqm?.let { sqmToPing(it) })}}"
+            "\"areaSqm\":${areaJson(item.areaSqm)},\"areaPing\":${areaJson(item.areaSqm?.let { sqmToPing(it) })},\"unregistered\":${item.unregistered}}"
     }.joinToString(","))
     sb.append("],")
     val main = mainBuilding(batch.buildingResults)
@@ -286,6 +292,13 @@ fun computeBatchWarnings(
                     "(Land + building prices sum to ${formatYuan(sum)}, but the minimal price total is ${formatYuan(total)})"
             )
         }
+    }
+    for (l in landResults.filter { it.section.isBlank() }) {
+        warnings.add("${l.landNumber}地號未解析到段別等坐落欄位 (No section/location found for land ${l.landNumber})")
+    }
+    val areaRows = buildingResults.filter { it.areaSqm != null }
+    if (areaRows.isNotEmpty() && areaRows.all { it.unregistered }) {
+        warnings.add("本標別建物全是未登記建物，建物面積以未登記建物計 (Every building is unregistered; the batch area uses them)")
     }
     for (b in buildingResults.filter { it.floorAreaSqm == null }) {
         warnings.add("${b.buildingNumber}建號未解析到樓層面積合計 (No floor area total found for building ${b.buildingNumber})")
@@ -365,7 +378,8 @@ fun parseNotice(document: PDDocument): Notice {
     val positioned = positionedLines(document)
     val landCells = CellPool(extractLandCells(positioned))
     val buildingCells = CellPool(extractBuildingCells(positioned))
-    val batches = splitBatches(getAttachmentText(sortedText)).map { parseBatch(it, subject, landCells, buildingCells) }
+    val sections = splitBatches(getAttachmentText(sortedText))
+    val batches = sections.map { parseBatch(it, subject, landCells, buildingCells, anyBatch = sections.size == 1) }
     val caseNumber = batches.map { it.caseNumber }.firstOrNull { it.isNotBlank() } ?: ""
     val owners = batches.map { it.owner }.filter { it.isNotBlank() }.distinct()
     return Notice(
@@ -379,15 +393,35 @@ fun parseNotice(document: PDDocument): Notice {
     )
 }
 
+/** 使用情形、備註說是未登記建物的句子。 */
+val UNREGISTERED_STATEMENT = Regex("""未登記建物|未辦理建築物所有權第一次登記""")
+
+/**
+ * 使用情形、備註說是未登記建物的建號：句子的主詞，也就是句中第一組建號。
+ * 「264建號、265建號係未登記建物」→ {264, 265}；「拍賣之7364及7367建號建物為6554建號建物之增建，因未辦理建築物所有權
+ * 第一次登記」→ {7364, 7367} (6554 是被增建的主建物，不算)；「暫編第2500建號之建物，係第556建號主建物之增建部分，未辦理…」→ {2500}。
+ */
+fun unregisteredBuildingNumbers(text: String): Set<String> {
+    val numbers = Regex("""第?\d+(?:建號)?(?:[、及和與]第?\d+(?:建號)?)*建號""")
+    return text.replace(Regex("""\s"""), "").split(Regex("""[。；]""")).flatMap { sentence ->
+        val at = UNREGISTERED_STATEMENT.find(sentence)?.range?.first ?: return@flatMap emptyList()
+        val subject = numbers.find(sentence.substring(0, at)) ?: return@flatMap emptyList()
+        Regex("""\d+""").findAll(subject.value).map { it.value }.toList()
+    }.toSet()
+}
+
 /** 解析一個標別段落；土地與建物只在同一標別內對應。`subject` 是公告的主旨與依據，用來判定分割變價拍賣。 */
 fun parseBatch(
     section: BatchSection,
     subject: String = "",
     landCells: CellPool<LandCells> = CellPool(emptyList()),
-    buildingCells: CellPool<BuildingCells> = CellPool(emptyList())
+    buildingCells: CellPool<BuildingCells> = CellPool(emptyList()),
+    anyBatch: Boolean = true
 ): Batch {
-    val landResults = parseLandLocations(section.text, landCells)
+    val landResults = parseLandLocations(section.text, landCells, section.batchNumber, anyBatch)
+    val unregisteredInText = unregisteredBuildingNumbers(extractUsage(section.text) + "\n" + extractRemarks(section.text))
     val buildingResults = parseBuildings(section.text, buildingCells)
+        .map { if (it.buildingNumber in unregisteredInText) it.copy(unregistered = true) else it }
     linkBuildingsToLand(landResults, buildingResults)
     val (caseNumber, owner) = extractCaseNumberAndOwner(section.text)
     // 備註是內文，換行可能斷在數字中間 (「新台幣：38,59」接「0,000元」)，接起各行再找
@@ -580,7 +614,7 @@ fun renderReport(notice: Notice): String {
         batch.buildingAreaSqm?.let {
             row("📐 建物面積 Building Area: " + formatArea(it))
             row("   樓層面積合計 Floor Area: " + formatArea(batch.floorAreaSqm!!))
-            row("   陽台 Balcony: " + formatArea(batch.balconySqm!!))
+            row("   陽台/平台 Balcony/Platform: " + formatArea(batch.balconySqm!!))
         }
         batch.pricePerPing?.let { row("🏷️ 每坪單價 Price per Ping: " + "%,.1f".format(it) + " 元/坪") }
 
@@ -623,7 +657,8 @@ fun renderReport(notice: Notice): String {
                 if (item.areaSqm != null) {
                     row("  📐 建物面積 Building Area:     " + formatArea(item.areaSqm))
                     row("     樓層面積合計 Floor Area:    " + formatArea(item.floorAreaSqm!!))
-                    row("     陽台 Balcony:              " + formatArea(item.balconySqm))
+                    row("     陽台/平台 Balcony/Platform: " + formatArea(item.balconySqm))
+                    if (item.unregistered) row("     ⚠️ 未登記建物，不算進標別建物面積 Unregistered; not in the batch area")
                 }
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
                 if (item.shareSale) row("  🧩 持分 Share:                  是 Yes (僅拍賣應有部分)")
@@ -873,7 +908,8 @@ fun extractPositionSortedText(document: PDDocument): String {
         }
     }
     stripper.sortByPosition = true
-    return stripper.getText(document).lines()
+    // 不換行空白 (U+00A0) 不算 \s：「吳興 \u00A0三 61-6」這種列會整列比對不到，先換成一般空白
+    return stripper.getText(document).replace('\u00A0', ' ').lines()
         .map { it.trim() }
         .filterNot { it.matches(Regex("""第[一二三四五六七八九十\d]{1,4}頁|[(（]續上頁[)）]""")) }
         .joinToString("\n")
@@ -1573,7 +1609,32 @@ fun joinWrappedLandNumber(landNo: String, nextLine: String?): String {
     return if (suffix.length + head.length == 4) landNo + head else landNo
 }
 
-fun parseLandLocations(attachmentText: String, landCells: CellPool<LandCells> = CellPool(emptyList())): List<LandLocation> {
+/**
+ * 從土地表格中含有 `landNo` 的那一列，取地號前面的坐落文字 (「1 臺北市 信義區 吳興 三 61-6 …」)：
+ * 縣市、鄉鎮市區、段、小段。取不到的欄位為 ""。
+ */
+fun landLocationFromRow(lines: List<String>, landNo: String): List<String> {
+    // 地號後面接面積，才是表格列 (不是使用情形裡的「119 地號」)
+    val head = Regex("""^(.*?[一-龥].*?)\s+${Regex.escape(landNo)}\s+[\d,]+(?:\.\d+)?(?:\s|$)""")
+    val tokens = lines.firstNotNullOfOrNull { head.find(it.trim())?.groupValues?.get(1) }
+        ?.split(Regex("""\s+"""))?.filter { it.matches(Regex("""[一-龥0-9]+""")) && !it.all(Char::isDigit) }
+        ?.toMutableList() ?: return listOf("", "", "", "")
+    val county = tokens.firstOrNull()?.takeIf { it.matches(Regex("""[一-龥]{2}[縣市]""")) }?.also { tokens.removeAt(0) } ?: ""
+    val district = tokens.firstOrNull()?.takeIf { it.matches(Regex("""[一-龥]{1,3}[區市鎮鄉]""")) }?.also { tokens.removeAt(0) } ?: ""
+    val section = tokens.getOrNull(0)?.removeSuffix("段")?.let { it + "段" } ?: ""
+    val subSection = tokens.getOrNull(1)?.let { if (it.endsWith("小段")) it else it + "小段" } ?: ""
+    return listOf(county, district, section, subSection)
+}
+
+/**
+ * `landCells` 的列只有 `anyBatch` 或標別等於 `batchNumber` 時才會補成土地 (多標別時，不能拿別的標別的列)。
+ */
+fun parseLandLocations(
+    attachmentText: String,
+    landCells: CellPool<LandCells> = CellPool(emptyList()),
+    batchNumber: String? = null,
+    anyBatch: Boolean = true
+): List<LandLocation> {
     val results = mutableListOf<LandLocation>()
     val lines = attachmentText.lines()
 
@@ -1585,8 +1646,9 @@ fun parseLandLocations(attachmentText: String, landCells: CellPool<LandCells> = 
     )
     // 附表土地表格的一列：編號 縣市 鄉鎮市區 段 小段 地號 面積 …，段與小段常不帶「段」「小段」字樣
     // (例如 "1 臺北市 中山區 正義 四 290 1073.3 1000000分 3,520,000元")，故優先以整列欄位比對。
+    // 面積可能帶千分位 (「119 1,243 192分之2」)。
     val tableRowRegex = Regex(
-        """^(?:\d+\s+)?(?<county>[\u4e00-\u9fa5]{2}[縣市])\s+(?<district>[\u4e00-\u9fa5]{1,3}[區市鎮鄉])\s+(?<section>[\u4e00-\u9fa5]{2,8})\s+(?:(?<subSection>[\u4e00-\u9fa50-9]{1,6})\s+)?(?<landNo>\d+(?:-\d+)?)\s+\d+(?:\.\d+)?(?:\s|$)"""
+        """^(?:\d+\s+)?(?<county>[\u4e00-\u9fa5]{2}[縣市])\s+(?<district>[\u4e00-\u9fa5]{1,3}[區市鎮鄉])\s+(?<section>[\u4e00-\u9fa5]{2,8})\s+(?:(?<subSection>[\u4e00-\u9fa50-9]{1,6})\s+)?(?<landNo>\d+(?:-\d+)?)\s+(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s|$)"""
     )
 
     for ((index, line) in lines.withIndex()) {
@@ -1661,11 +1723,31 @@ fun parseLandLocations(attachmentText: String, landCells: CellPool<LandCells> = 
         }
     }
 
+    // 地號、權利範圍、最低拍賣價格三欄都依欄位位置取到，就是一筆拍賣土地；上面整列比對不到 (縣市、段、小段的寫法
+    // 不同、面積格式不同、奇怪的空白字元…) 也不影響，坐落欄位盡量從該列文字補上，補不到就留空。
+    while (true) {
+        val cells = landCells.take { (anyBatch || it.batch == batchNumber) && isCompleteLandCells(it) } ?: break
+        if (results.any { it.landNumber == cells.landNumber || isWrappedNumber(it.landNumber, cells.landNumber) }) continue
+        val (county, district, section, subSection) = landLocationFromRow(lines, cells.landNumber)
+        results.add(
+            LandLocation(
+                id = (results.size + 1).toString(),
+                county = county,
+                district = district,
+                section = section,
+                subSection = subSection,
+                landNumber = cells.landNumber,
+                rightScope = cells.scope,
+                landMinimalPrice = cells.price
+            )
+        )
+    }
+
     return results
 }
 
 /**
- * 建物列 (備考之前) 的樓層面積合計，以及要另加的附屬建物陽台面積 (平方公尺)。
+ * 建物列 (備考之前) 的樓層面積合計，以及要另加的附屬建物陽台、平台面積 (平方公尺)。
  * 例如「七層: 87.13 陽臺:15.03 … 合計: 87.13」→ (87.13, 15.03)。
  * 陽台若列在樓層面積欄且已含在合計內 (如「5層: 102.26 陽台: 25.37 合計: 127.63」)，就不再另加 → (127.63, 0)。
  * 找不到合計時樓層面積為 null。
@@ -1674,15 +1756,15 @@ fun extractBuildingArea(rowText: String): Pair<BigDecimal?, BigDecimal> {
     val number = """\d+(?:\.\d+)?"""
     val total = Regex("""合\s*計\s*[:：]\s*(?<v>$number)""").find(rowText)
         ?.groups?.get("v")?.value?.toBigDecimal() ?: return Pair(null, BigDecimal.ZERO)
-    // 「陽台7.14」「陽台: 25.37」「陽臺，面積15.43」
-    val balconies = Regex("""陽\s*[台臺]\s*(?:[，,]\s*)?(?:面\s*積\s*)?[:：(（]?\s*(?<v>$number)""").findAll(rowText)
+    // 「陽台7.14」「陽台: 25.37」「陽臺，面積15.43」「平台8.19」「平台:5.41」「平台(8.51)」
+    val balconies = Regex("""[陽平]\s*[台臺]\s*(?:[，,]\s*)?(?:面\s*積\s*)?[:：(（]?\s*(?<v>$number)""").findAll(rowText)
         .map { it.groups["v"]!!.value.toBigDecimal() }.toList()
     val balcony = balconies.fold(BigDecimal.ZERO, BigDecimal::add)
     // 樓層面積欄 (「標示: 數字」) 除合計以外的加總剛好等於合計，代表其中的陽台已算進合計
     val entries = Regex("""(?<label>[^\s:：]+)\s*[:：]\s*(?<v>$number)""").findAll(rowText)
         .filter { !Regex("""合\s*計""").containsMatchIn(it.groups["label"]!!.value) }
         .toList()
-    val balconyListed = entries.any { Regex("""陽\s*[台臺]""").containsMatchIn(it.groups["label"]!!.value) }
+    val balconyListed = entries.any { Regex("""[陽平]\s*[台臺]""").containsMatchIn(it.groups["label"]!!.value) }
     val entrySum = entries.fold(BigDecimal.ZERO) { acc, m -> acc.add(m.groups["v"]!!.value.toBigDecimal()) }
     val included = balconyListed && entrySum.compareTo(total) == 0
     return Pair(total, if (included) BigDecimal.ZERO else balcony)
@@ -1701,8 +1783,12 @@ data class BuildingCells(
     val price: String = ""
 )
 
-/** 依欄位位置取出的一列土地：地號、權利範圍與最低拍賣價格欄的文字，欄內拆行已接回。 */
-data class LandCells(val landNumber: String, val scope: String, val price: String)
+/** 依欄位位置取出的一列土地：地號、權利範圍與最低拍賣價格欄的文字，欄內拆行已接回；`batch` 是這列所在的標別 (未標示為 null)。 */
+data class LandCells(val landNumber: String, val scope: String, val price: String, val batch: String? = null)
+
+/** 地號、權利範圍、最低拍賣價格三欄都完整，這列就是一筆拍賣土地。 */
+fun isCompleteLandCells(cells: LandCells): Boolean =
+    cells.landNumber.matches(Regex("""\d+(?:-\d+)?""")) && isCompleteRightScope(cells.scope) && isCompletePrice(cells.price)
 
 /**
  * 依文字的 x 座標取出土地表格各列的地號、權利範圍與最低拍賣價格 (同 [extractBuildingCells] 的做法)。
@@ -1717,12 +1803,14 @@ fun extractLandCells(lines: List<List<Glyph>>): List<LandCells> {
     val results = mutableListOf<LandCells>()
     var row: Row? = null
     var inRemark = false
+    var batch: String? = null
     fun finishRow() {
-        row?.let { if (it.no.isNotEmpty()) results.add(LandCells(it.no.toString(), it.scope.toString(), it.price.toString())) }
+        row?.let { if (it.no.isNotEmpty()) results.add(LandCells(it.no.toString(), it.scope.toString(), it.price.toString(), batch)) }
         row = null
     }
     for ((index, line) in lines.withIndex()) {
         val t = lineText(line)
+        BATCH_HEADER_REGEX.find(t)?.let { finishRow(); batch = normalizeBatchNumber(it.groups["batch"]!!.value) }
         if (t.contains("鄉鎮市區") && t.contains("地號")) {
             finishRow()
             val header = lines.subList(maxOf(0, index - 2), minOf(lines.size, index + 3)).filter { l -> lineText(l).none { it.isDigit() } }
@@ -2015,6 +2103,10 @@ fun parseBuildings(attachmentText: String, buildingCells: CellPool<BuildingCells
         val (bType, bTypeRule) = determineBuildingTypeWithRule(floors, located, blockText, firstMainType)
         // 共同使用部分的合計是整棟公設面積，不算建物面積
         val isCommonAreaRow = rowText.contains("共同使用部分") || rowText.contains("公設")
+        // 未登記建物：建物列寫「第一層未登記部分」「…號未登記」，或備考寫「未登記建物查封」
+        // (「…之未登」接「記部分」會斷行，比對前先去掉空白)
+        val isUnregistered = rowText.replace(Regex("""\s"""), "").contains("未登記") ||
+            blockText.substringAfter("備考", "").replace(Regex("""\s"""), "").contains("未登記建物")
         val (floorArea, balcony) = extractBuildingArea(cells?.let { it.floorArea + "\n" + it.annex } ?: rowText)
         if (firstMainType == null && !isCommonAreaRow) {
             firstMainType = bType
@@ -2033,7 +2125,8 @@ fun parseBuildings(attachmentText: String, buildingCells: CellPool<BuildingCells
             commonArea = isCommonAreaRow,
             floorAreaSqm = floorArea,
             balconySqm = balcony,
-            areaSqm = if (isCommonAreaRow) null else floorArea?.add(balcony)
+            areaSqm = if (isCommonAreaRow) null else floorArea?.add(balcony),
+            unregistered = isUnregistered
         )
         if (results.none { it.buildingNumber == item.buildingNumber }) {
             results.add(item)
