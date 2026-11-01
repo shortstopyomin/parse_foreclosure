@@ -77,11 +77,11 @@ data class Batch(
     val usage: String,             // 使用情形
     val unnaturalDeath: Boolean,   // 是否曾發生非自然死亡 (凶宅)
     val unnaturalDeathEvidence: String, // 判定為凶宅所依據的句子；不是凶宅時為 ""
-    val 分割變價拍賣: Boolean,      // 是否為分割共有物或分割遺產的變價拍賣
-    val 分割變價拍賣依據: String,   // 判定為分割變價拍賣所依據的句子；不是時為 ""
-    val 分割變價類型: PartitionSaleType?, // 遺產分割或共有物分割的變價拍賣，見 [partitionSaleType]；不是分割變價拍賣時為 null
-    val 持分拍賣: Boolean,          // 是否僅拍賣所有權之應有部分 (持分)
-    val 持分拍賣依據: String,       // 判定為持分拍賣所依據的句子；不是時為 ""
+    val isPartitionSale: Boolean,  // 是否為分割共有物或分割遺產的變價拍賣
+    val partitionSaleEvidence: String, // 判定為分割變價拍賣所依據的句子；不是時為 ""
+    val partitionSaleType: PartitionSaleType?, // 遺產分割或共有物分割的變價拍賣，見 [partitionSaleType]；不是分割變價拍賣時為 null
+    val isShare: Boolean,          // 是否為持分拍賣 (僅拍賣所有權之應有部分)
+    val shareEvidence: String,     // 判定為持分拍賣所依據的句子；不是時為 ""
     val remarks: String,           // 備註
     val landResults: List<LandLocation>,
     val buildingResults: List<BuildingInfo>,
@@ -106,7 +106,7 @@ data class Batch(
      * 用第一筆持分的建物或土地的權利範圍。不是持分拍賣時為 null。
      */
     val shareScope: String?
-        get() = if (!持分拍賣) null else (
+        get() = if (!isShare) null else (
             buildingResults.firstOrNull()?.takeIf { it.shareSale }?.rightScope
                 ?: buildingResults.firstOrNull { it.shareSale }?.rightScope
                 ?: landResults.firstOrNull { it.shareSale }?.rightScope
@@ -235,11 +235,11 @@ fun batchJson(batch: Batch): String {
     sb.append("\"usage\":${jsonString(batch.usage.ifBlank { null })},")
     sb.append("\"unnaturalDeath\":${batch.unnaturalDeath},")
     sb.append("\"unnaturalDeathEvidence\":${jsonString(batch.unnaturalDeathEvidence.ifBlank { null })},")
-    sb.append("\"partitionSale\":${batch.分割變價拍賣},")
-    sb.append("\"partitionSaleEvidence\":${jsonString(batch.分割變價拍賣依據)},")
-    sb.append("\"partitionSaleType\":${jsonString(batch.分割變價類型?.json)},")
-    sb.append("\"shareSale\":${batch.持分拍賣},")
-    sb.append("\"shareSaleEvidence\":${jsonString(batch.持分拍賣依據)},")
+    sb.append("\"partitionSale\":${batch.isPartitionSale},")
+    sb.append("\"partitionSaleEvidence\":${jsonString(batch.partitionSaleEvidence)},")
+    sb.append("\"partitionSaleType\":${jsonString(batch.partitionSaleType?.json)},")
+    sb.append("\"shareSale\":${batch.isShare},")
+    sb.append("\"shareSaleEvidence\":${jsonString(batch.shareEvidence)},")
     sb.append("\"remarks\":${jsonString(batch.remarks.ifBlank { null })},")
     sb.append("\"landParcels\":[")
     sb.append(batch.landResults.mapIndexed { index, item ->
@@ -473,10 +473,10 @@ fun parseBatch(
     val handoverField = extractHandover(section.text)
     val handover = determineHandover(handoverField, usage + "\n" + remarks)
     // 分割變價拍賣只看本標別的使用情形與備註 (各欄分開找，句子才不會跨欄接在一起)；不看主旨
-    val 分割變價拍賣依據 = findStatement(PARTITION_SALE, usage).ifBlank { findStatement(PARTITION_SALE, remarks) }
+    val partitionSaleEvidence = findStatement(PARTITION_SALE, usage).ifBlank { findStatement(PARTITION_SALE, remarks) }
     // 持分拍賣依本標別的使用情形、備註與表格備考欄判斷
     val shareStatements = findShareSaleStatements(usage + "\n" + remarks + "\n" + extractTableNotes(section.text))
-    val 持分拍賣依據 = shareStatements.firstOrNull()?.sentence ?: ""
+    val shareEvidence = shareStatements.firstOrNull()?.sentence ?: ""
     val shareTargets = shareSaleTargets(shareStatements)
     return Batch(
         batchNumber = section.batchNumber,
@@ -492,11 +492,11 @@ fun parseBatch(
         usage = usage,
         unnaturalDeath = unnaturalDeathEvidence.isNotBlank(),
         unnaturalDeathEvidence = unnaturalDeathEvidence,
-        分割變價拍賣 = 分割變價拍賣依據.isNotBlank(),
-        分割變價拍賣依據 = 分割變價拍賣依據,
-        分割變價類型 = 分割變價拍賣依據.ifBlank { null }?.let { partitionSaleType(usage + "\n" + remarks) },
-        持分拍賣 = 持分拍賣依據.isNotBlank(),
-        持分拍賣依據 = 持分拍賣依據,
+        isPartitionSale = partitionSaleEvidence.isNotBlank(),
+        partitionSaleEvidence = partitionSaleEvidence,
+        partitionSaleType = partitionSaleEvidence.ifBlank { null }?.let { partitionSaleType(usage + "\n" + remarks) },
+        isShare = shareEvidence.isNotBlank(),
+        shareEvidence = shareEvidence,
         remarks = remarks,
         landResults = landResults.map { it.copy(shareSale = shareTargets.coversLand(it)) },
         buildingResults = buildingResults.map { it.copy(shareSale = shareTargets.coversBuilding(it)) },
@@ -646,13 +646,13 @@ fun renderReport(notice: Notice): String {
         }
         // 兩種分割變價拍賣各印一行，是的那一種下面印判定依據
         for (type in PartitionSaleType.values()) {
-            val yes = batch.分割變價類型 == type
+            val yes = batch.partitionSaleType == type
             row("⚖️ ${type.label}: " + if (yes) "是 Yes" else "否 No")
-            if (yes) row("   " + batch.分割變價拍賣依據)
+            if (yes) row("   " + batch.partitionSaleEvidence)
         }
-        if (batch.持分拍賣) {
+        if (batch.isShare) {
             row("🧩 拍賣持分 Share(僅拍賣應有部分): 是 Yes" + (batch.shareScope?.let { ", $it" } ?: ""))
-            row("   " + batch.持分拍賣依據)
+            row("   " + batch.shareEvidence)
         } else {
             row("🧩 拍賣持分 Share(僅拍賣應有部分): 否 No")
         }
