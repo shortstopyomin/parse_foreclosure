@@ -100,6 +100,17 @@ data class Batch(
             rows.filter { !it.unregistered }.ifEmpty { rows }
         }
 
+    /**
+     * 拍賣持分的佔比：第一筆建物是持分時用它的權利範圍；第一筆建物是全部 (只拍賣土地應有部分) 或沒有建物時，
+     * 用第一筆持分的建物或土地的權利範圍。不是持分拍賣時為 null。
+     */
+    val shareScope: String?
+        get() = if (!持分拍賣) null else (
+            buildingResults.firstOrNull()?.takeIf { it.shareSale }?.rightScope
+                ?: buildingResults.firstOrNull { it.shareSale }?.rightScope
+                ?: landResults.firstOrNull { it.shareSale }?.rightScope
+            )?.ifBlank { null }
+
     /** 本標別建物面積 (平方公尺)：各建物依權利範圍換算後的建物面積加總；沒有任何建物面積時為 null。 */
     val buildingAreaSqm: BigDecimal?
         get() = areaBuildings.takeIf { it.isNotEmpty() }?.fold(BigDecimal.ZERO) { acc, b -> acc.add(b.areaSqm) }
@@ -462,7 +473,8 @@ fun parseBatch(
     val handover = determineHandover(handoverField, usage + "\n" + remarks)
     val 分割變價拍賣依據 = findStatement(PARTITION_SALE, usage + "\n" + remarks)
         .ifBlank { findStatement(SUBJECT_PARTITION_SALE, subject) }
-    val shareStatements = findShareSaleStatements(usage + "\n" + remarks)
+    // 持分拍賣依本標別的使用情形、備註與表格備考欄判斷
+    val shareStatements = findShareSaleStatements(usage + "\n" + remarks + "\n" + extractTableNotes(section.text))
     val 持分拍賣依據 = shareStatements.firstOrNull()?.sentence ?: ""
     val shareTargets = shareSaleTargets(shareStatements)
     return Batch(
@@ -635,8 +647,10 @@ fun renderReport(notice: Notice): String {
             row("   " + batch.分割變價拍賣依據)
         }
         if (batch.持分拍賣) {
-            row("🧩 持分拍賣 (僅拍賣應有部分) Share Sale: 是 Yes")
+            row("🧩 拍賣持分 Share(僅拍賣應有部分): 是 Yes" + (batch.shareScope?.let { ", $it" } ?: ""))
             row("   " + batch.持分拍賣依據)
+        } else {
+            row("🧩 拍賣持分 Share(僅拍賣應有部分): 否 No")
         }
         batch.buildingAreaSqm?.let {
             row("📐 建物面積 Building Area: " + formatArea(it))
@@ -659,7 +673,7 @@ fun renderReport(notice: Notice): String {
                 row("  🔹 小段 Subsection:             " + (if (item.subSection.isBlank()) "(無小段 / 空白 None/Blank)" else item.subSection))
                 row("  📌 地號 Land Number:            " + (if (item.landNumber.isBlank()) "None" else item.landNumber + " 地號 (Land No. " + item.landNumber + ")"))
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
-                if (item.shareSale) row("  🧩 持分 Share:                  是 Yes (僅拍賣應有部分)")
+                if (item.shareSale) row("  🧩 拍賣持分 Share:              " + (batch.shareScope ?: item.rightScope))
                 if (item.landMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Land Minimal Price: " + item.landMinimalPrice)
                 val bldgText = if (item.buildingNumbers.isNotEmpty()) {
                     item.buildingNumbers.joinToString(", ") { it + " 建號 (Building No. " + it + ")" }
@@ -691,7 +705,7 @@ fun renderReport(notice: Notice): String {
                     if (item.unregistered) row("     ⚠️ 未登記建物，不算進標別建物面積 Unregistered; not in the batch area")
                 }
                 if (item.rightScope.isNotBlank()) row("  ⚖️ 權利範圍 Ownership Scope:    " + item.rightScope)
-                if (item.shareSale) row("  🧩 持分 Share:                  是 Yes (僅拍賣應有部分)")
+                if (item.shareSale) row("  🧩 拍賣持分 Share:              " + (batch.shareScope ?: item.rightScope))
                 if (item.buildingMinimalPrice.isNotBlank()) row("  💰 最低拍賣價格 Building Minimal Price: " + item.buildingMinimalPrice)
             }
         }
@@ -1284,6 +1298,13 @@ val PARTITION_SALE = Regex(
 val SHARE_SALE = Regex("""拍賣[^。；;，,]{0,15}(?:應有部分|持分)""")
 
 /**
+ * 法條或程序的宣告，不是在描述本件拍賣的是應有部分：
+ * 「依共有人之應有部分比例共同承買」「須就其有應有部分之標的一併行使」(優先承買)、
+ * 「拍賣之應有部分，於核發權利移轉證書前，如有經分割共有物形成判決確定之情形者，執行法院得撤銷拍定」、「依民法第824條…」。
+ */
+val SHARE_LEGAL_DECLARATION = Regex("""法第|第\d+條|優先承買|優先承購|核發權利移轉證書|分割共有物形成判決|撤銷拍定""")
+
+/**
  * 主旨與依據中的分割變價拍賣：「分割遺產（變價）強制執行事件」或依據「強制執行法第131條」。
  * 只寫「分割遺產強制執行事件」且依據第81條的 (114年司執字第160931號，「債務人陳榮富所有」)，
  * 是執行分割遺產判決中的金錢給付，拍賣的是單一債務人的財產，不是變價分割。
@@ -1297,7 +1318,10 @@ data class ShareSaleStatement(val sentence: String, val clause: String)
  * 使用情形與備註中明確的持分拍賣說法，依出現順序。說法之前的子句要有「本件、僅、係、為」
  * (「十、本件編號1建物即7899建號拍賣應有部分」「609-12地號土地僅拍賣債務人應有部分」)；
  * 一般性的提醒 (「拍賣之應有部分，於核發權利移轉證書前，如有經分割共有物形成判決確定之情形者…」) 不算，
- * 假設或詢問 (「如、若、是否」) 也不算。
+ * 假設或詢問 (「如、若、是否」) 也不算；「拍賣共有物全部持分」是拍賣整筆，也不算。
+ * 另外，子句描述了「應有部分」(「高廷揚應有部分4分之1」「現場查封部分債務人應有部分時」) 也算，
+ * 但法條或程序的宣告 ([SHARE_LEGAL_DECLARATION]) 與假設不算。「持分」只算「拍賣…持分」的說法：
+ * 備考的「含共同使用部分2313建號之持分」「3929建號基地之持分」是公設與基地的持分，不是持分拍賣。
  */
 fun findShareSaleStatements(text: String): List<ShareSaleStatement> {
     val joined = text.lines().joinToString("") { it.trim() }
@@ -1305,14 +1329,54 @@ fun findShareSaleStatements(text: String): List<ShareSaleStatement> {
     for (sentence in joined.split(Regex("""(?<=[。；;])"""))) {
         for (rawClause in sentence.split(Regex("""(?<=[，,])"""))) {
             val clause = normalizeForMatch(rawClause)
-            val m = SHARE_SALE.find(clause) ?: continue
+            val m = SHARE_SALE.find(clause)
+            if (m == null) {
+                if (isShareDescription(clause, normalizeForMatch(sentence))) results.add(ShareSaleStatement(sentence.trim(), clause))
+                continue
+            }
             val before = clause.substring(0, m.range.first)
             if (Regex("""如|若|是否""").containsMatchIn(before)) continue
+            // 「本件係拍賣共有物全部持分」是全體共有人的持分都拍賣，等於拍賣整筆，不是持分拍賣
+            if (m.value.contains("全部")) continue
             if (!Regex("""本件|僅|係|為""").containsMatchIn(before)) continue
             results.add(ShareSaleStatement(sentence.trim(), clause))
         }
     }
     return results
+}
+
+/**
+ * 子句描述了應有部分 (不是全部應有部分，也不是假設)，且所在的句子不是法條宣告
+ * (「如有多數共有人行使優先承買權，則依共有人之應有部分比例共同承買之」的優先承買在前一個子句)。
+ */
+fun isShareDescription(clause: String, sentence: String): Boolean {
+    val at = clause.indexOf("應有部分")
+    if (at < 0) return false
+    if (Regex("""如|若|是否""").containsMatchIn(clause.substring(0, at))) return false
+    return !clause.contains("全部應有部分") && !SHARE_LEGAL_DECLARATION.containsMatchIn(sentence)
+}
+
+/**
+ * 表格中各列的備考欄 (「備考 高廷揚應有部分4分之1，高振洋…七人各」接「應有部分為28分之1。」)，
+ * 到下一列 (「編號 建號」、編號開頭的資料列)、點交情形、使用情形或備註為止；左邊界行號與頁碼不算。
+ */
+fun extractTableNotes(text: String): String {
+    val notes = mutableListOf<String>()
+    var inNote = false
+    val end = Regex("""^(?:編\s*號|點\s*交\s*情\s*形|使\s*用\s*情\s*形|備\s*註|標\s*別|\d+\s+\S)""")
+    for (raw in text.lines()) {
+        val l = raw.trim()
+        if (l.matches(Regex("""備\s*考.*"""))) {
+            inNote = true
+            notes.add(l.replace(Regex("""^備\s*考\s*"""), ""))
+            continue
+        }
+        if (!inNote) continue
+        if (end.containsMatchIn(l)) { inNote = false; continue }
+        if (l.isBlank() || l.matches(Regex("""\d{1,2}""")) || PAGE_MARK_LINE.matches(l)) continue
+        notes[notes.size - 1] = notes.last() + l
+    }
+    return notes.filter { it.isNotBlank() }.joinToString("\n") { it.trimEnd('。') + "。" }
 }
 
 /** 持分拍賣說法所涵蓋的列：指名的地號、建號，或整類 (全部土地、全部建物)。 */
@@ -1563,6 +1627,15 @@ fun extractFloorInfo(blockText: String): Pair<Int?, String> {
                 locatedFloor = num?.toString() ?: raw
             }
         }
+    }
+
+    // 樓層面積列出多個樓層 (跨層的「第2樓層」「第3樓層」「第4樓層」→ 2~4)，門牌卻寫單一樓層 (「234之1號2樓」)：
+    // 門牌的樓層在範圍內就以門牌為所在樓層；透天的門牌通常沒有樓層，維持範圍
+    Regex("""^(\d+)~(\d+)$""").find(locatedFloor)?.let { range ->
+        val (low, high) = range.destructured
+        val doorFloor = Regex("""號\s*(?<loc>\d+|[一二三四五六七八九十]+)\s*[層樓](?!\s*頂)""").find(blockText)
+            ?.groups?.get("loc")?.value?.let { chineseNumberToInt(it) }
+        if (doorFloor != null && doorFloor in low.toInt()..high.toInt()) locatedFloor = doorFloor.toString()
     }
 
     return Pair(totalFloors, locatedFloor)
